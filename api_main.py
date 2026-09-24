@@ -10,7 +10,7 @@ Usage:
     python api_main.py
     EE_SERVICE_ACCOUNT_JSON='...' python api_main.py   # flood endpoint needs GEE
 
-Flood logic uses jalnetra.flood_deps (vendored Sentinel-1 helpers).
+Flood logic reuses ../flood_tile (Sentinel-1 SAR).
 BOD/COD logic reuses jalnetra demo pipeline (synthetic demo data).
 Vegetation type/health uses Sentinel-2 + Dynamic World (GEE).
 """
@@ -39,37 +39,44 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, Response
 
 HERE = Path(__file__).resolve().parent
+FLOOD_TILE_DIR = HERE.parent / "flood_tile"
 sys.path.insert(0, str(HERE))
+if FLOOD_TILE_DIR.is_dir():
+    sys.path.insert(0, str(FLOOD_TILE_DIR))
 
-from jalnetra.api_service import bod_cod_pipeline  # noqa: E402
-from jalnetra.bank_erosion_service import (  # noqa: E402
+from jalnetra.api_service import bod_cod_pipeline
+from jalnetra.bank_erosion_service import (
     analyze_bank_erosion,
     bank_erosion_geometry,
 )
-from jalnetra.kml_buffer import buffered_analysis_geometry  # noqa: E402
-from jalnetra.lithology_service import analyze_lithology, lithology_geometry  # noqa: E402
-from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry  # noqa: E402
-from jalnetra.salinity_service import analyze_salinity, salinity_geometry  # noqa: E402
-from jalnetra.silt_service import analyze_silt, silt_geometry  # noqa: E402
-from jalnetra.fishing_point_service import (  # noqa: E402
+from jalnetra.kml_buffer import buffered_analysis_geometry
+from jalnetra.lithology_service import analyze_lithology, lithology_geometry
+from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
+from jalnetra.salinity_service import analyze_salinity, salinity_geometry
+from jalnetra.silt_service import analyze_silt, silt_geometry
+from jalnetra.fishing_point_service import (
     analyze_fishing_points,
     fishing_point_geometry,
 )
-from jalnetra.fabdem_service import download_fabdem_dtm_from_kml  # noqa: E402
-from jalnetra.copernicus_dsm_service import (  # noqa: E402
-    download_copernicus_dsm_from_kml,
-)
-from jalnetra.water_quality_service import (  # noqa: E402
+from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
+from jalnetra.water_quality_service import (
     analyze_water_quality,
     water_quality_geometry,
 )
+<<<<<<< HEAD
 from jalnetra.water_depth_service import analyze_live_water_depth  # noqa: E402
 from jalnetra.vegetation_service import (  # noqa: E402
+=======
+from jalnetra.vegetation_service import (
+>>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
     analyze_vegetation_health,
     analyze_vegetation_type,
     default_date_range,
 )
+<<<<<<< HEAD
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes  # noqa: E402
+=======
+>>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -248,9 +255,14 @@ async def root() -> Dict[str, Any]:
             "POST /api/flood-water, POST /api/bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
+<<<<<<< HEAD
             "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, POST /api/silt, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
             "POST /api/copernicus-dsm"
+=======
+            "POST /api/water-quality, POST /api/lithology, POST /api/silt, "
+            "POST /api/fishing-point, POST /api/fabdem-dtm"
+>>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
         ),
         "ngrok_free_tier": (
             "Browser: click 'Visit Site' once on the ngrok warning page, then use /docs. "
@@ -269,23 +281,13 @@ async def health() -> Dict[str, Any]:
     }
 
 
-def _store_smoothed_kml(kml_bytes: bytes) -> str:
-    """Cache KML after coverage-aware pixel smoothing (GroundOverlay PNG only)."""
-    kml_id = uuid.uuid4().hex
-    try:
-        _KML_CACHE[kml_id] = smooth_kml_bytes(kml_bytes)
-    except Exception:
-        # Never break API downloads if smoothing fails — serve original KML.
-        _KML_CACHE[kml_id] = kml_bytes
-    return kml_id
-
-
 def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
     """Attach one KML download URL per image date."""
     datewise_out: List[Dict[str, Any]] = []
     for entry in result.get("datewise") or []:
         row = {k: v for k, v in entry.items() if k != "kml_bytes"}
-        kml_id = _store_smoothed_kml(entry["kml_bytes"])
+        kml_id = uuid.uuid4().hex
+        _KML_CACHE[kml_id] = entry["kml_bytes"]
         row["kml_id"] = kml_id
         row["kml_download_url"] = _public_url(
             request, f"/api/flood-water/kml/{kml_id}"
@@ -323,7 +325,7 @@ async def flood_water(
         raise HTTPException(status_code=400, detail="KML file is empty.")
 
     try:
-        from jalnetra.flood_deps.kml_utils import (
+        from kml_utils import (  # type: ignore[import-untyped]
             parse_kml_plots,
             plots_to_combined_geometry,
         )
@@ -331,7 +333,7 @@ async def flood_water(
     except ImportError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Flood-water dependencies failed to import: {exc}",
+            detail=f"flood_tile modules not found at {FLOOD_TILE_DIR}: {exc}",
         ) from exc
 
     plots = parse_kml_plots(kml_bytes)
@@ -378,8 +380,8 @@ async def bod_cod(
     """
     Upload KML → BOD/COD for that river (unique per KML).
 
-    River name from the KML; chainage uses fixed 2 km segments (0–2, 2–4, …)
-    for that KML length. Returns live history, today's snapshot, 10-day forecast,
+    River name and bridge / placemark names from the KML drive chainage and
+    reach labels. Returns live history, today's snapshot, 10-day forecast,
     and a dashboard_url for an HTML viewer titled for that river.
     """
     kml_bytes = await kml.read()
@@ -452,7 +454,7 @@ def _require_earth_engine() -> None:
 
 
 def _kml_geometry_from_bytes(kml_bytes: bytes):
-    from jalnetra.flood_deps.kml_utils import kml_bytes_to_ee_geometry
+    from kml_utils import kml_bytes_to_ee_geometry  # type: ignore[import-untyped]
 
     return kml_bytes_to_ee_geometry(kml_bytes)
 
@@ -460,7 +462,8 @@ def _kml_geometry_from_bytes(kml_bytes: bytes):
 def _vegetation_response(
     request: Request, result: Dict[str, Any], *, prefix: str, filename: str
 ) -> Dict[str, Any]:
-    kml_id = _store_smoothed_kml(result.pop("kml_bytes"))
+    kml_id = uuid.uuid4().hex
+    _KML_CACHE[kml_id] = result.pop("kml_bytes")
     result["kml_id"] = kml_id
     result["kml_download_url"] = _public_url(
         request, f"/api/{prefix}/kml/{kml_id}"
@@ -478,7 +481,8 @@ def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[st
         "ndci": ("ndci_kml_bytes", "ndci_chlorophyll.kml"),
     }
     for layer_key, (bytes_key, filename) in layers.items():
-        kml_id = _store_smoothed_kml(result.pop(bytes_key))
+        kml_id = uuid.uuid4().hex
+        _KML_CACHE[kml_id] = result.pop(bytes_key)
         result[layer_key]["kml_id"] = kml_id
         result[layer_key]["kml_download_url"] = _public_url(
             request, f"/api/water-quality/kml/{kml_id}"
@@ -494,7 +498,8 @@ def _silt_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
         if bytes_key not in result:
             continue
         filename = result["months"][key].get("kml_filename", f"silt_{key}.kml")
-        kml_id = _store_smoothed_kml(result.pop(bytes_key))
+        kml_id = uuid.uuid4().hex
+        _KML_CACHE[kml_id] = result.pop(bytes_key)
         result["months"][key]["kml_id"] = kml_id
         result["months"][key]["kml_download_url"] = _public_url(
             request, f"/api/silt/kml/{kml_id}"
@@ -533,7 +538,8 @@ def _lulc_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
         if bytes_key not in result:
             continue
         filename = result["years"][year_key].get("kml_filename", f"lulc_{year}.kml")
-        kml_id = _store_smoothed_kml(result.pop(bytes_key))
+        kml_id = uuid.uuid4().hex
+        _KML_CACHE[kml_id] = result.pop(bytes_key)
         result["years"][year_key]["kml_id"] = kml_id
         result["years"][year_key]["kml_download_url"] = _public_url(
             request, f"/api/lulc/kml/{kml_id}"
@@ -911,6 +917,7 @@ async def download_water_quality_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_quality.kml"'},
     )
+<<<<<<< HEAD
 
 
 @app.post("/api/water-depth")
@@ -955,6 +962,8 @@ async def download_water_depth_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_depth.kml"'},
     )
+=======
+>>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
 
 
 @app.post("/api/lithology")
@@ -1181,62 +1190,6 @@ async def download_fabdem_dtm_tif(tif_id: str) -> Response:
         headers={
             "Content-Disposition": (
                 'attachment; filename="FABDEM_DTM_KML_Clipped.tif"'
-            )
-        },
-    )
-
-
-@app.post("/api/copernicus-dsm")
-async def copernicus_dsm(
-    request: Request,
-    kml: UploadFile = File(..., description="KML AOI boundary"),
-) -> Dict[str, Any]:
-    """
-    Upload KML → download Copernicus GLO-30 DSM for the KML bbox, clip to
-    exact KML geometry, and return a GeoTIFF download URL (open in QGIS).
-
-    Digital Surface Model (includes buildings / vegetation). No Earth Engine.
-    """
-    kml_bytes = await kml.read()
-    if not kml_bytes:
-        raise HTTPException(status_code=400, detail="KML file is empty.")
-
-    try:
-        result = await asyncio.to_thread(
-            download_copernicus_dsm_from_kml, kml_bytes
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Copernicus DSM failed: {exc}"
-        ) from exc
-
-    tif_id = uuid.uuid4().hex
-    _TIF_CACHE[tif_id] = result.pop("tif_bytes")
-    result["tif_id"] = tif_id
-    result["tif_download_url"] = _public_url(
-        request, f"/api/copernicus-dsm/tif/{tif_id}"
-    )
-    return result
-
-
-@app.get("/api/copernicus-dsm/tif/{tif_id}")
-async def download_copernicus_dsm_tif(tif_id: str) -> Response:
-    tif_bytes = _TIF_CACHE.get(tif_id)
-    if tif_bytes is None:
-        raise HTTPException(
-            status_code=404,
-            detail="TIFF not found or expired. Run POST /api/copernicus-dsm again.",
-        )
-    return Response(
-        content=tif_bytes,
-        media_type="image/tiff",
-        headers={
-            "Content-Disposition": (
-                'attachment; filename="Copernicus_DSM_KML_Clipped.tif"'
             )
         },
     )

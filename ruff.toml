@@ -1,0 +1,32 @@
+# Ruff configuration for JalNetra
+# https://docs.astral.sh/ruff/configuration/
+
+[lint]
+# E402 = module level import not at top of file
+# This project intentionally inserts sys.path before imports
+# so E402 is globally ignored rather than suppressed per-line
+ignore = ["E402", "RUF100"]
+
+# extend the default select
+select = ["E", "F", "W", "I", "N", "UP", "B", "RUF"]
+
+# exclude generated/data files
+exclude = [
+    ".git",
+    "__pycache__",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "*.egg-info",
+]
+
+[lint.per-file-ignores]
+# test files can use assert and broad exceptions
+"test_*.py" = ["S101", "BLE001"]
+"*_test.py" = ["S101", "BLE001"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

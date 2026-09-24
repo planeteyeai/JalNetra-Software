@@ -1,0 +1,96 @@
+rules:
+  # Rule 8 — SQL injection via string concatenation
+  - id: sql-string-concat-js
+    patterns:
+      - pattern: |
+          $QUERY = "..." + $VAR
+      - pattern-either:
+          - pattern-inside: |
+              $DB.query($QUERY, ...)
+          - pattern-inside: |
+              $DB.execute($QUERY, ...)
+    message: "R08: SQL string concatenation detected. Use parameterized queries."
+    severity: ERROR
+    languages: [javascript, typescript]
+
+  - id: sql-string-concat-python
+    patterns:
+      - pattern: |
+          $CUR.execute("..." % $VAR)
+      - pattern: |
+          $CUR.execute("..." + $VAR)
+    message: "R08: SQL string concatenation in Python. Use parameterized queries with %s placeholders."
+    severity: ERROR
+    languages: [python]
+
+  # Rule 6 — Hardcoded secrets
+  - id: hardcoded-password
+    patterns:
+      - pattern: |
+          $VAR = "..."
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (password|passwd|secret|api_key|apikey|token|private_key)
+      - metavariable-regex:
+          metavariable: "\"...\""
+          regex: .{6,}
+    message: "R06: Potential hardcoded secret. Use environment variables or a secret manager."
+    severity: ERROR
+    languages: [javascript, typescript, python, java, go]
+
+  # Rule 11 — Empty catch blocks (JS/TS)
+  - id: empty-catch-block
+    pattern: |
+      try { ... } catch ($E) { }
+    message: "R11: Empty catch block silently swallows errors. Handle or log the exception."
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  # Rule 5 — eval() usage
+  - id: dangerous-eval
+    pattern: eval($X)
+    message: "R05 (A05): eval() is a code injection risk. Avoid or use safer alternatives."
+    severity: ERROR
+    languages: [javascript, typescript, python]
+
+  # Rule 5 — Disabled TLS verification
+  - id: tls-verification-disabled
+    pattern-either:
+      - pattern: |
+          { rejectUnauthorized: false }
+      - pattern: |
+          ssl_verify = False
+      - pattern: |
+          verify=False
+    message: "R05 (A06): TLS/SSL verification disabled. This is a security misconfiguration."
+    severity: ERROR
+    languages: [javascript, typescript, python]
+
+  # Rule 5 — Weak hash algorithms
+  - id: weak-hash-algorithm
+    pattern-either:
+      - pattern: |
+          hashlib.md5(...)
+      - pattern: |
+          hashlib.sha1(...)
+      - pattern: |
+          crypto.createHash("md5")
+      - pattern: |
+          crypto.createHash("sha1")
+    message: "R05 (A04): Weak hash algorithm (MD5/SHA1). Use SHA-256 or stronger."
+    severity: ERROR
+    languages: [python, javascript, typescript]
+
+  # Rule 12 — Logging sensitive data
+  - id: log-sensitive-data
+    patterns:
+      - pattern-either:
+          - pattern: console.log(..., $VAR, ...)
+          - pattern: logger.info(..., $VAR, ...)
+          - pattern: print($VAR)
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: .*(password|token|secret|key|credential).*
+    message: "R12: Potentially logging sensitive data. Never log passwords, tokens, or secrets."
+    severity: WARNING
+    languages: [javascript, typescript, python]

@@ -1,0 +1,109 @@
+# ============================================================
+# Pre-commit hooks — Software Development Policy
+# Install: pip install pre-commit && pre-commit install
+# Run all: pre-commit run --all-files
+# ============================================================
+repos:
+  # ---- Rule 6: Secrets ----
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        name: "[R06] Secret Detection"
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Rule 6: catch common credential patterns
+      - id: detect-private-key
+        name: "[R06] Detect Private Keys"
+      - id: detect-aws-credentials
+        name: "[R06] Detect AWS Credentials"
+        args: [--allow-missing-credentials]
+
+      # Rule 3: clean code basics
+      - id: trailing-whitespace
+        name: "[R03] Trailing Whitespace"
+      - id: end-of-file-fixer
+        name: "[R03] End of File Fixer"
+      - id: check-yaml
+        name: "[R03] YAML Syntax"
+      - id: check-json
+        name: "[R03] JSON Syntax"
+      - id: check-toml
+        name: "[R03] TOML Syntax"
+      - id: mixed-line-ending
+        name: "[R03] Mixed Line Endings"
+
+      # Rule 15: git hygiene
+      - id: check-merge-conflict
+        name: "[R15] Merge Conflict Markers"
+      - id: no-commit-to-branch
+        name: "[R15] No Direct Commit to main/master"
+        args: [--branch, main, --branch, master]
+
+      # Rule 18: config safety
+      - id: check-added-large-files
+        name: "[R18] Large File Check"
+        args: [--maxkb=500]
+
+  # ---- Rule 3: JS/TS linting ----
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v8.57.0
+    hooks:
+      - id: eslint
+        name: "[R03] ESLint"
+        files: \.(js|jsx|ts|tsx)$
+        exclude: (node_modules|dist|build)/
+        additional_dependencies:
+          - eslint@8
+          - eslint-plugin-security@latest
+
+  # ---- Rule 3: Python linting ----
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.10
+    hooks:
+      - id: ruff
+        name: "[R03] Ruff Python Linter"
+        args: [--fix]
+      - id: ruff-format
+        name: "[R03] Ruff Python Formatter"
+
+  # ---- Rule 5: Python security ----
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.9
+    hooks:
+      - id: bandit
+        name: "[R05] Bandit Security Scan"
+        args: [-r, -ll]
+        exclude: tests/|test_
+
+  # ---- Rule 15: Commit message convention ----
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.2.0
+    hooks:
+      - id: conventional-pre-commit
+        name: "[R15] Conventional Commit Format"
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, test, chore, ci, build, perf, revert]
+
+  # ---- Rule 8: SQL safety (local script) ----
+  - repo: local
+    hooks:
+      - id: check-raw-sql
+        name: "[R08] Raw SQL Concatenation"
+        language: script
+        entry: .policy-system/scripts/check-database.sh
+        pass_filenames: false
+
+      - id: check-error-handling
+        name: "[R11] Silent Error Handling"
+        language: script
+        entry: .policy-system/scripts/check-error-handling.sh
+        pass_filenames: false
+
+      - id: check-logging
+        name: "[R12] Logging Safety"
+        language: script
+        entry: .policy-system/scripts/check-logging.sh
+        pass_filenames: false

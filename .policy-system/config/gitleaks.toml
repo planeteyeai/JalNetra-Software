@@ -1,0 +1,54 @@
+# Gitleaks configuration — Rule 6: Never hard-code secrets
+title = "Software Development Policy — Secret Detection"
+
+[extend]
+useDefault = true  # extends built-in ruleset
+
+[[rules]]
+id = "generic-api-key"
+description = "R06: Generic API key pattern"
+regex = '''(?i)(api[_-]?key|apikey)\s*[:=]\s*["\x27]([a-zA-Z0-9_\-]{20,})["\x27]'''
+tags = ["secret", "rule-6"]
+
+[[rules]]
+id = "generic-password"
+description = "R06: Hardcoded password"
+regex = '''(?i)(password|passwd|pwd)\s*[:=]\s*["\x27]([^"\x27\s]{6,})["\x27]'''
+tags = ["secret", "rule-6"]
+[rules.allowlist]
+regexes = [
+  "password.*placeholder",
+  "password.*example",
+  "password.*your[-_]",
+  "\\$\\{.*\\}",      # template variables
+  "process\\.env\\.",  # env var references
+]
+
+[[rules]]
+id = "jwt-token"
+description = "R06: JWT token hardcoded"
+regex = '''eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*'''
+tags = ["secret", "rule-6"]
+
+[[rules]]
+id = "private-key-header"
+description = "R06: Private key block"
+regex = '''-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY( BLOCK)?-----'''
+tags = ["secret", "rule-6"]
+
+[allowlist]
+description = "Global allowlist"
+paths = [
+  ".policy-reports/",
+  "*.md",
+  "*.example",
+  "*.sample",
+  "*.template",
+  "*.test.js",
+  "*.test.ts",
+  "*.spec.js",
+  "*.spec.ts",
+  "test/",
+  "tests/",
+  "__tests__/",
+]
