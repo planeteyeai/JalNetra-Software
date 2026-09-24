@@ -2,8 +2,8 @@
 JalNetra live water-depth analysis.
 
 Input: an EE geometry derived from a KML polygon.
-Output: KML GroundOverlays containing:
-  - smooth Sentinel-1 water extent in blue
+Output: two KMLs —
+  - permanent / SAR water extent in blue
   - Sentinel-2 relative depth in green -> yellow -> orange -> red
 
 Depth is a relative optical band-ratio estimate, not survey-grade bathymetry.
@@ -14,8 +14,8 @@ import base64
 import os
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
-from typing import Any, Dict
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 from xml.dom import minidom
 
 import ee
@@ -84,16 +84,39 @@ def _overlay(doc: ET.Element, name: str, png: bytes, box: Dict[str, float], opac
     _el(llb, "west", f"{box['west']:.8f}")
 
 
-def _build_kml(title: str, description: str, box: Dict[str, float], water_png: bytes, depth_png: bytes) -> bytes:
+def _ee_ymd(image: ee.Image) -> Optional[str]:
+    """Read YYYY-MM-DD from an Earth Engine image timestamp."""
+    try:
+        return ee.Date(image.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+    except Exception:
+        return None
+
+
+def _ee_ymd_list(collection: ee.ImageCollection) -> List[str]:
+    """Unique image dates in a collection, oldest first."""
+    try:
+        millis = collection.aggregate_array("system:time_start").getInfo() or []
+    except Exception:
+        return []
+    dates = set()
+    for value in millis:
+        try:
+            dates.add(
+                datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).strftime(
+                    "%Y-%m-%d"
+                )
+            )
+        except (TypeError, ValueError, OSError):
+            continue
+    return sorted(dates)
+
+
+def _build_kml(title: str, description: str, box: Dict[str, float], overlay_name: str, png: bytes) -> bytes:
     root = ET.Element(f"{{{KML_NS}}}kml")
     doc = _el(root, "Document")
     _el(doc, "name", title)
     _el(doc, "description", description)
-    _overlay(doc, "Smooth Water - Blue", water_png, box, "cc")
-    _overlay(doc, "Water Depth - Green to Red", depth_png, box, "cc")
-    # A simple legend is included as screen text so the KML is self-explanatory.
-    screen = _el(doc, "ScreenOverlay")
-    _el(screen, "name", "Depth Legend: Green = Low, Yellow = Medium-Low, Orange = Medium-High, Red = High")
+    _overlay(doc, overlay_name, png, box, "cc")
     xml_bytes = ET.tostring(root, encoding="utf-8")
     return minidom.parseString(xml_bytes).toprettyxml(indent="  ", encoding="utf-8")
 
@@ -115,6 +138,9 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
     if int(s1.size().getInfo() or 0) == 0:
         raise ValueError(f"No Sentinel-1 VV image found in the live window {s1_start} to {today}.")
 
+    s1_image_dates = _ee_ymd_list(s1)
+    s1_image_date = _ee_ymd(ee.Image(s1.sort("system:time_start", False).first()))
+
     # Latest available S1 mosaic, followed by focal median smoothing as in the supplied workflow.
     water_db = s1.sort("system:time_start", False).mosaic().clip(geometry)
     water = (water_db.focal_median(30, "circle", "meters")
@@ -129,7 +155,9 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
     if int(s2.size().getInfo() or 0) == 0:
         raise ValueError(f"No Sentinel-2 image found in the live window {s2_start} to {today}.")
 
-    s2_best = ee.Image(s2.first()).clip(geometry)
+    s2_best_raw = ee.Image(s2.first())
+    s2_image_date = _ee_ymd(s2_best_raw)
+    s2_best = s2_best_raw.clip(geometry)
     scl = s2_best.select("SCL")
     cloud_mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
     clean = s2_best.updateMask(cloud_mask)
@@ -177,15 +205,30 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
         reducer=ee.Reducer.sum(), geometry=geometry, scale=10, maxPixels=1e13
     ).getInfo().get("area")
 
-    kml = _build_kml(
-        f"Live Water Depth - {today.isoformat()}",
-        f"Sentinel-1 water + Sentinel-2 relative depth. Analysis date: {today.isoformat()}. "
-        f"Water area: {water_area_ha} ha. Depth range: {depth_min}-{depth_max} m. "
+    water_kml = _build_kml(
+        f"Permanent Water - {s1_image_date or today.isoformat()}",
+        f"Sentinel-1 SAR water extent (blue). Image date: {s1_image_date or 'unknown'}. "
+        f"Water area: {water_area_ha} ha.",
+        box,
+        "Permanent Water - Blue",
+        water_png,
+    )
+    depth_kml = _build_kml(
+        f"Water Depth - {s2_image_date or today.isoformat()}",
+        f"Sentinel-2 relative depth. Image date: {s2_image_date or 'unknown'}. "
+        f"Analysis date: {today.isoformat()}. Water area: {water_area_ha} ha. "
+        f"Depth range: {depth_min}-{depth_max} m. "
         "Depth is a relative band-ratio estimate and is not survey-grade bathymetry.",
-        box, water_png, depth_png,
+        box,
+        "Water Depth - Green to Red",
+        depth_png,
     )
     return {
         "analysis_date": today.isoformat(),
+        "image_date": s2_image_date,
+        "sentinel1_image_date": s1_image_date,
+        "sentinel1_image_dates": s1_image_dates,
+        "sentinel2_image_date": s2_image_date,
         "sentinel1_window": {"start": s1_start.isoformat(), "end": today.isoformat()},
         "sentinel2_window": {"start": s2_start.isoformat(), "end": today.isoformat()},
         "water_area_ha": water_area_ha,
@@ -197,6 +240,8 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
             "medium_high_depth": "#FFA500",
             "high_depth": "#FF0000",
         },
-        "kml_bytes": kml,
-        "kml_filename": f"water_depth_{today.isoformat()}.kml",
+        "water_kml_bytes": water_kml,
+        "depth_kml_bytes": depth_kml,
+        "water_kml_filename": f"permanent_water_{s1_image_date or today.isoformat()}.kml",
+        "depth_kml_filename": f"water_depth_{s2_image_date or today.isoformat()}.kml",
     }

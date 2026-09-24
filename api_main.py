@@ -63,13 +63,13 @@ from jalnetra.water_quality_service import (  # noqa: E402
     analyze_water_quality,
     water_quality_geometry,
 )
+from jalnetra.water_depth_service import analyze_live_water_depth  # noqa: E402
 from jalnetra.vegetation_service import (  # noqa: E402
     analyze_vegetation_health,
     analyze_vegetation_type,
     default_date_range,
 )
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes  # noqa: E402
-from jalnetra.water_depth_service import analyze_live_water_depth
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -248,7 +248,7 @@ async def root() -> Dict[str, Any]:
             "POST /api/flood-water, POST /api/bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
-            "POST /api/water-quality, POST /api/lithology, POST /api/silt, "
+            "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, POST /api/silt, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
             "POST /api/copernicus-dsm"
         ),
@@ -500,6 +500,28 @@ def _silt_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
             request, f"/api/silt/kml/{kml_id}"
         )
         result["months"][key]["kml_filename"] = filename
+    return result
+
+
+def _water_depth_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach permanent-water (blue) and depth KML download URLs."""
+    water_id = _store_smoothed_kml(result.pop("water_kml_bytes"))
+    depth_id = _store_smoothed_kml(result.pop("depth_kml_bytes"))
+    result["permanent_water"] = {
+        "kml_id": water_id,
+        "kml_download_url": _public_url(
+            request, f"/api/water-depth/kml/{water_id}"
+        ),
+        "kml_filename": result.pop("water_kml_filename", "permanent_water.kml"),
+        "color": "#0000FF",
+    }
+    result["depth"]["kml_id"] = depth_id
+    result["depth"]["kml_download_url"] = _public_url(
+        request, f"/api/water-depth/kml/{depth_id}"
+    )
+    result["depth"]["kml_filename"] = result.pop(
+        "depth_kml_filename", "water_depth.kml"
+    )
     return result
 
 
@@ -889,38 +911,45 @@ async def download_water_quality_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_quality.kml"'},
     )
+
+
 @app.post("/api/water-depth")
 async def water_depth(
     request: Request,
-    kml: UploadFile = File(..., description="KML file with water/river boundary"),
+    kml: UploadFile = File(..., description="KML AOI boundary"),
 ) -> Dict[str, Any]:
-    """Upload KML -> live Sentinel-1 water + Sentinel-2 relative depth KML."""
+    """
+    Upload KML → two downloadable KMLs: blue permanent/SAR water and relative depth.
+
+    Response includes the actual Sentinel-1 and Sentinel-2 image dates used.
+    """
     _require_earth_engine()
+
     kml_bytes = await kml.read()
     if not kml_bytes:
         raise HTTPException(status_code=400, detail="KML file is empty.")
+
     try:
-        from jalnetra.flood_deps.kml_utils import parse_kml_plots, plots_to_combined_geometry
-        plots = parse_kml_plots(kml_bytes)
-        geometry = plots_to_combined_geometry(plots)
-        result = await asyncio.to_thread(analyze_live_water_depth, geometry)
+        aoi_geom = await asyncio.to_thread(_kml_geometry_from_bytes, kml_bytes)
+        result = await asyncio.to_thread(analyze_live_water_depth, aoi_geom)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Water-depth analysis failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Water depth analysis failed: {exc}"
+        ) from exc
 
-    kml_id = uuid.uuid4().hex
-    _KML_CACHE[kml_id] = result.pop("kml_bytes")
-    result["kml_id"] = kml_id
-    result["kml_download_url"] = _public_url(request, f"/api/water-depth/kml/{kml_id}")
-    return result
+    return _water_depth_response(request, result)
 
 
 @app.get("/api/water-depth/kml/{kml_id}")
 async def download_water_depth_kml(kml_id: str) -> Response:
     kml_bytes = _KML_CACHE.get(kml_id)
     if kml_bytes is None:
-        raise HTTPException(status_code=404, detail="KML not found or expired. Run POST /api/water-depth again.")
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/water-depth again.",
+        )
     return Response(
         content=kml_bytes,
         media_type="application/vnd.google-earth.kml+xml",
