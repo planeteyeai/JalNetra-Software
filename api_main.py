@@ -308,7 +308,7 @@ async def flood_water(
         raise HTTPException(status_code=400, detail="KML file is empty.")
 
     try:
-        from kml_utils import (  # type: ignore[import-untyped]
+        from jalnetra.flood_deps.kml_utils import (
             parse_kml_plots,
             plots_to_combined_geometry,
         )
@@ -316,7 +316,7 @@ async def flood_water(
     except ImportError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"flood_tile modules not found at {FLOOD_TILE_DIR}: {exc}",
+            detail=f"Flood modules could not be imported: {exc}",
         ) from exc
 
     plots = parse_kml_plots(kml_bytes)
@@ -437,7 +437,7 @@ def _require_earth_engine() -> None:
 
 
 def _kml_geometry_from_bytes(kml_bytes: bytes):
-    from kml_utils import kml_bytes_to_ee_geometry  # type: ignore[import-untyped]
+    from jalnetra.flood_deps.kml_utils import kml_bytes_to_ee_geometry
 
     return kml_bytes_to_ee_geometry(kml_bytes)
 
