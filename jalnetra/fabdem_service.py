@@ -23,12 +23,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
+import numpy as np
 import rasterio
 import rasterio.merge
 import requests
 import shapely.geometry
+from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
 from rasterio.mask import mask
+from rasterio.transform import Affine
+from rasterio.warp import reproject
 from requests import Session
+from scipy.ndimage import gaussian_filter
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +46,13 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT = (30, 600)  # connect, read
 MAX_RETRIES = 3
+
+# DTM edge smoothing: bilinear upsample then nodata-aware Gaussian so 30 m
+# FABDEM cells render as continuous slopes instead of square steps.
+DTM_SMOOTH_UPSCALE = 3
+DTM_SMOOTH_SIGMA_PX = 1.5  # in upsampled pixels
+DTM_SMOOTH_MAX_PIXELS = 40_000_000
+DTM_NODATA = -9999.0
 
 
 def _session() -> Session:
@@ -526,6 +539,87 @@ def _download_fabdem_for_bounds(
         }
 
 
+def _smooth_dtm(
+    src_path: Path, dst_path: Path, aoi_geometry: Any
+) -> Dict[str, Any]:
+    """Upsample + Gaussian-smooth a clipped DTM, re-clipped to the KML geometry."""
+    with rasterio.open(src_path) as src:
+        data = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        height, width = data.shape
+        inside = geometry_mask(
+            [aoi_geometry.__geo_interface__],
+            out_shape=(height, width),
+            transform=src.transform,
+            invert=True,
+            all_touched=True,
+        )
+        valid = inside & np.isfinite(data)
+        if nodata is not None:
+            valid &= data != nodata
+
+        upscale = DTM_SMOOTH_UPSCALE
+        while upscale > 1 and height * width * upscale * upscale > DTM_SMOOTH_MAX_PIXELS:
+            upscale -= 1
+        out_h, out_w = height * upscale, width * upscale
+        out_transform = src.transform * Affine.scale(1.0 / upscale)
+
+        src_filled = np.where(valid, data, DTM_NODATA).astype(np.float32)
+        upsampled = np.full((out_h, out_w), DTM_NODATA, dtype=np.float32)
+        reproject(
+            source=src_filled,
+            destination=upsampled,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=DTM_NODATA,
+            dst_transform=out_transform,
+            dst_crs=src.crs,
+            dst_nodata=DTM_NODATA,
+            resampling=Resampling.bilinear,
+        )
+
+        up_valid = upsampled != DTM_NODATA
+        weights = up_valid.astype(np.float32)
+        numerator = gaussian_filter(np.where(up_valid, upsampled, 0.0), DTM_SMOOTH_SIGMA_PX)
+        denominator = gaussian_filter(weights, DTM_SMOOTH_SIGMA_PX)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            smoothed = np.where(
+                denominator > 1e-6, numerator / np.maximum(denominator, 1e-6), DTM_NODATA
+            ).astype(np.float32)
+
+        out_inside = geometry_mask(
+            [aoi_geometry.__geo_interface__],
+            out_shape=(out_h, out_w),
+            transform=out_transform,
+            invert=True,
+        )
+        keep = out_inside & (denominator > 1e-6)
+        smoothed = np.where(keep, smoothed, DTM_NODATA).astype(np.float32)
+
+        meta = src.meta.copy()
+        meta.update(
+            {
+                "driver": "GTiff",
+                "dtype": "float32",
+                "nodata": DTM_NODATA,
+                "height": out_h,
+                "width": out_w,
+                "transform": out_transform,
+                "compress": "deflate",
+            }
+        )
+        with rasterio.open(dst_path, "w", **meta) as dst:
+            dst.write(smoothed, 1)
+
+    return {
+        "upscale": upscale,
+        "sigma_px": DTM_SMOOTH_SIGMA_PX,
+        "width": out_w,
+        "height": out_h,
+        "nodata": DTM_NODATA,
+    }
+
+
 def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
     """
     Download FABDEM for the KML bbox and clip to the KML boundary.
@@ -617,7 +711,14 @@ def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
         except Exception as error:
             raise RuntimeError(f"FABDEM clipping failed: {error}") from error
 
-        tif_bytes = output_file.read_bytes()
+        smoothed_file = output_dir / "FABDEM_DTM_KML_Clipped_Smoothed.tif"
+        try:
+            smoothing = _smooth_dtm(output_file, smoothed_file, aoi_geometry)
+        except Exception as error:
+            raise RuntimeError(f"FABDEM edge smoothing failed: {error}") from error
+
+        raw_tif_bytes = output_file.read_bytes()
+        tif_bytes = smoothed_file.read_bytes()
 
         return {
             "bounds": {
@@ -628,10 +729,21 @@ def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
             },
             "geometry_type": str(aoi_geometry.geom_type),
             "crs": "EPSG:4326",
-            "width": int(clipped.shape[2]),
-            "height": int(clipped.shape[1]),
+            "width": int(smoothing["width"]),
+            "height": int(smoothing["height"]),
+            "raw_width": int(clipped.shape[2]),
+            "raw_height": int(clipped.shape[1]),
             "tif_filename": "FABDEM_DTM_KML_Clipped.tif",
             "tif_bytes": tif_bytes,
+            "raw_tif_filename": "FABDEM_DTM_KML_Clipped_Raw.tif",
+            "raw_tif_bytes": raw_tif_bytes,
+            "smoothing": {
+                "method": (
+                    "Bilinear upsample + nodata-aware Gaussian blur, re-clipped "
+                    "to KML — removes square 30 m cell steps (continuous slopes)."
+                ),
+                **smoothing,
+            },
             "download": dl_meta,
             "notes": {
                 "source": "FABDEM (Forest And Buildings removed Copernicus DEM)",

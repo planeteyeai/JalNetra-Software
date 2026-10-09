@@ -12,13 +12,19 @@ from __future__ import annotations
 
 import base64
 import os
-import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 from xml.dom import minidom
 
 import ee
+
+from jalnetra.ee_http import read_url
+from jalnetra.scene_dates import (
+    S2_MAX_CLOUD_PCT,
+    select_clear_s2_date,
+    select_recent_s1_date,
+)
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 MAX_EXPORT_PIXELS = 8_000_000
@@ -60,8 +66,7 @@ def _download_png(image: ee.Image, geometry: ee.Geometry, scale: float) -> bytes
         url = image.getDownloadURL(params)
     except Exception:
         url = image.getThumbURL({"region": geometry, "scale": scale, "format": "png"})
-    with urllib.request.urlopen(url, timeout=900) as resp:
-        return resp.read()
+    return read_url(url, timeout=900)
 
 
 def _el(parent: ET.Element, tag: str, text: str | None = None) -> ET.Element:
@@ -121,22 +126,25 @@ def _build_kml(title: str, description: str, box: Dict[str, float], overlay_name
     return minidom.parseString(xml_bytes).toprettyxml(indent="  ", encoding="utf-8")
 
 
-def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
+def analyze_live_water_depth(
+    geometry: ee.Geometry,
+    depth_min_m: Optional[float] = None,
+    depth_max_m: Optional[float] = None,
+) -> Dict[str, Any]:
     today = date.today()
-    # Recent windows are deliberately wider than a single revisit so sparse Sentinel scenes can be found.
-    s1_start = today - timedelta(days=int(os.getenv("WATER_DEPTH_S1_DAYS", "12")))
-    s2_start = today - timedelta(days=int(os.getenv("WATER_DEPTH_S2_DAYS", "30")))
-    s1_end = today + timedelta(days=1)
-    s2_end = today + timedelta(days=1)
+    s1_selection = select_recent_s1_date(geometry, today=today, polarisation="VV")
+    s2_selection = select_clear_s2_date(geometry, today=today)
 
     s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
           .filterBounds(geometry)
-          .filterDate(s1_start.isoformat(), s1_end.isoformat())
+          .filterDate(s1_selection["start_date"], s1_selection["end_date"])
           .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
           .filter(ee.Filter.eq("instrumentMode", "IW"))
           .select("VV"))
     if int(s1.size().getInfo() or 0) == 0:
-        raise ValueError(f"No Sentinel-1 VV image found in the live window {s1_start} to {today}.")
+        raise ValueError(
+            f"No Sentinel-1 VV image found on {s1_selection['selected_date']}."
+        )
 
     s1_image_dates = _ee_ymd_list(s1)
     s1_image_date = _ee_ymd(ee.Image(s1.sort("system:time_start", False).first()))
@@ -148,12 +156,14 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
 
     s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
           .filterBounds(geometry)
-          .filterDate(s2_start.isoformat(), s2_end.isoformat())
-          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
+          .filterDate(s2_selection["start_date"], s2_selection["end_date"])
+          .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", S2_MAX_CLOUD_PCT))
           .select(["B2", "B3", "SCL"])
           .sort("CLOUDY_PIXEL_PERCENTAGE"))
     if int(s2.size().getInfo() or 0) == 0:
-        raise ValueError(f"No Sentinel-2 image found in the live window {s2_start} to {today}.")
+        raise ValueError(
+            f"No Sentinel-2 image found on {s2_selection['selected_date']}."
+        )
 
     s2_best_raw = ee.Image(s2.first())
     s2_image_date = _ee_ymd(s2_best_raw)
@@ -171,8 +181,16 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
     p_low = ee.Number(percentiles.get("ratio_p2"))
     p_high = ee.Number(percentiles.get("ratio_p98"))
 
-    depth_min = float(os.getenv("WATER_DEPTH_MIN_M", "1.5"))
-    depth_max = float(os.getenv("WATER_DEPTH_MAX_M", "2.0"))
+    depth_min = (
+        float(depth_min_m) if depth_min_m is not None
+        else float(os.getenv("WATER_DEPTH_MIN_M", "1.5"))
+    )
+    depth_max = (
+        float(depth_max_m) if depth_max_m is not None
+        else float(os.getenv("WATER_DEPTH_MAX_M", "2.0"))
+    )
+    if depth_max <= depth_min:
+        raise ValueError("Maximum depth must be greater than minimum depth.")
     depth = (ratio_water.unitScale(p_low, p_high).clamp(0, 1)
              .multiply(depth_max - depth_min).add(depth_min).rename("depth_m").clip(geometry))
 
@@ -229,8 +247,15 @@ def analyze_live_water_depth(geometry: ee.Geometry) -> Dict[str, Any]:
         "sentinel1_image_date": s1_image_date,
         "sentinel1_image_dates": s1_image_dates,
         "sentinel2_image_date": s2_image_date,
-        "sentinel1_window": {"start": s1_start.isoformat(), "end": today.isoformat()},
-        "sentinel2_window": {"start": s2_start.isoformat(), "end": today.isoformat()},
+        "sentinel1_window": {
+            "start": s1_selection["window_start"], "end": s1_selection["window_end"]
+        },
+        "sentinel2_window": {
+            "start": s2_selection["window_start"], "end": s2_selection["window_end"]
+        },
+        "sentinel1_selection": s1_selection,
+        "sentinel2_selection": s2_selection,
+        "input_depth_range_m": {"min": depth_min, "max": depth_max},
         "water_area_ha": water_area_ha,
         "depth": {"min_m": stats.get("depth_m_min"), "max_m": stats.get("depth_m_max"), "mean_m": stats.get("depth_m_mean")},
         "legend": {

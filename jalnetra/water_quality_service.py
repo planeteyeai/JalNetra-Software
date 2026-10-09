@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +16,7 @@ from xml.dom import minidom
 import ee
 from shapely.geometry import MultiPolygon, Polygon
 
+from jalnetra.ee_http import read_url
 from jalnetra.kml_buffer import (
     _geom_to_ee,
     _line_coords_for_kml,
@@ -33,7 +33,7 @@ SMOOTH_RADIUS_30M = 85
 DISPLAY_SMOOTH_M = 22
 MASK_SMOOTH_M = 35
 MAX_EXPORT_PIXELS = 12_000_000
-MAX_CLOUD_S2 = 30
+MAX_CLOUD_S2 = 40
 DW_WATER_THRESHOLD = 0.30
 
 WST_CLASSES: List[Dict[str, Any]] = [
@@ -257,14 +257,12 @@ def _export_overlay_png(
     }
     try:
         url = vis_image.getDownloadURL(download_params)
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
     except Exception:
         url = vis_image.getThumbURL(
             {"region": geometry, "scale": export_scale, "format": "png"}
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
 
 
 def _export_layers_parallel(
@@ -375,8 +373,14 @@ def analyze_water_quality(
     end_date: str,
     *,
     aoi_info: Optional[Dict[str, Any]] = None,
+    landsat_window: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Run water quality analysis and build four KML layers."""
+    """Run water quality analysis and build four KML layers.
+
+    `landsat_window` (start, end_exclusive) overrides the Landsat 9 WST date
+    range; Sentinel-2 / Dynamic World always use start_date..end_date.
+    """
+    l9_start, l9_end = landsat_window or (start_date, end_date)
     aoi_mask = _aoi_mask_image(aoi_geometry)
     analysis_area_ha = round(
         float(aoi_geometry.area(1).divide(10000).getInfo()), 2
@@ -463,13 +467,13 @@ def analyze_water_quality(
     l9_collection = (
         ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
         .filterBounds(aoi_geometry)
-        .filterDate(start_date, end_date)
+        .filterDate(l9_start, l9_end)
         .map(_mask_l9)
     )
     l9_count = int(l9_collection.size().getInfo() or 0)
     if l9_count == 0:
         raise ValueError(
-            f"No Landsat 9 scenes found between {start_date} and {end_date} "
+            f"No Landsat 9 scenes found between {l9_start} and {l9_end} "
             "for WST analysis."
         )
 
@@ -644,6 +648,7 @@ def analyze_water_quality(
         "latest_sentinel2_date": s2_date,
         "latest_dynamic_world_date": dw_date,
         "landsat9_image_count": l9_count,
+        "landsat9_window": {"start": l9_start, "end": l9_end},
         "wst": {k: v for k, v in wst_layer.items() if k != "kml_bytes"},
         "tss": {k: v for k, v in tss_layer.items() if k != "kml_bytes"},
         "ndwi": {k: v for k, v in ndwi_layer.items() if k != "kml_bytes"},

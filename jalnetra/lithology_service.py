@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 from xml.dom import minidom
@@ -16,6 +15,7 @@ import ee
 from pyproj import Transformer
 from shapely.ops import transform
 
+from jalnetra.ee_http import read_url
 from jalnetra.kml_buffer import (
     _geom_to_ee,
     _line_coords_for_kml,
@@ -27,7 +27,7 @@ from jalnetra.kml_buffer import (
 KML_NS = "http://www.opengis.net/kml/2.2"
 SCALE = 20
 TILE_SCALE = 4
-CLOUD_LIMIT = 25
+CLOUD_LIMIT = 40
 NUM_CLUSTERS = 8
 BUFFER_METERS = 50  # 50 m from KML border (not from centre)
 CLUSTER_TRAINING_SAMPLE_SIZE = 1200
@@ -269,8 +269,7 @@ def _export_overlay_png(
     ):
         try:
             url = vis_image.getThumbURL(params)
-            with urllib.request.urlopen(url, timeout=600) as resp:
-                return resp.read()
+            return read_url(url, timeout=600)
         except Exception:
             continue
     raise RuntimeError("Failed to export lithology overlay PNG from Earth Engine.")
@@ -387,9 +386,13 @@ def analyze_lithology(
     end_date: str,
     *,
     buffer_info: Optional[Dict[str, Any]] = None,
+    dry_season_only: bool = True,
 ) -> Dict[str, Any]:
     """
     Lithological spectral interpretation via Sentinel-2 median + K-Means clustering.
+
+    `dry_season_only=False` skips the Nov–Apr month filter (used when the API
+    passes an auto-selected recent clear-scene date).
 
     Water (class 0) and eight unsupervised lithology clusters (classes 1–8).
     Dense vegetation and invalid pixels remain transparent in the KML overlay.
@@ -406,21 +409,23 @@ def analyze_lithology(
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(aoi_geometry)
         .filterDate(start_date, end_date)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", CLOUD_LIMIT))
+        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", CLOUD_LIMIT))
     )
-    s2 = s2.filter(
-        ee.Filter.Or(
-            ee.Filter.calendarRange(11, 12, "month"),
-            ee.Filter.calendarRange(1, 4, "month"),
+    if dry_season_only:
+        s2 = s2.filter(
+            ee.Filter.Or(
+                ee.Filter.calendarRange(11, 12, "month"),
+                ee.Filter.calendarRange(1, 4, "month"),
+            )
         )
-    )
     s2 = s2.sort("CLOUDY_PIXEL_PERCENTAGE").limit(S2_SCENE_LIMIT).map(_mask_s2)
 
     image_count = int(s2.size().getInfo() or 0)
     if image_count == 0:
         raise ValueError(
-            f"No dry-season Sentinel-2 scenes found between {start_date} and "
-            f"{end_date} over the KML area (Nov–Dec or Jan–Apr months only)."
+            f"No {'dry-season ' if dry_season_only else ''}Sentinel-2 scenes found "
+            f"between {start_date} and {end_date} over the KML area"
+            + (" (Nov–Dec or Jan–Apr months only)." if dry_season_only else ".")
         )
 
     image = s2.median().clip(aoi_geometry)
@@ -590,7 +595,8 @@ def analyze_lithology(
         title="Lithological Spectral Interpretation",
         description=(
             f"Lithology · {start_date} to {end_date}\n"
-            f"Sentinel-2 dry-season median + K-Means ({NUM_CLUSTERS} clusters)\n"
+            f"Sentinel-2 {'dry-season median' if dry_season_only else 'clear scene'}"
+            f" + K-Means ({NUM_CLUSTERS} clusters)\n"
             f"Analysis area: {analysis_area_ha} ha · Resolution: {analysis_scale} m"
             f"{buf_desc}\n"
             "Cyan = input KML · Red outline = 50 m analysis buffer\n"
@@ -615,7 +621,9 @@ def analyze_lithology(
         "resolution_m": analysis_scale,
         "num_clusters": NUM_CLUSTERS,
         "cloud_limit_percent": CLOUD_LIMIT,
-        "dry_season_months": "November–December and January–April",
+        "dry_season_months": (
+            "November–December and January–April" if dry_season_only else None
+        ),
         "sentinel2_image_count": image_count,
         "kmeans_training_samples": CLUSTER_TRAINING_SAMPLE_SIZE,
         "categories": categories,

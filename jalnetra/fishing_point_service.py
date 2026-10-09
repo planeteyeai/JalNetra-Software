@@ -32,20 +32,18 @@ EXPECTED_CLEAR_OBS = 15
 MONTE_CARLO_ITERATIONS = 100
 ENABLE_MONTE_CARLO = True
 
+# End dates are exclusive: dry = Mar–Apr 2026, wet = Jul–Sep 2026.
 DRY_WINDOWS: List[List[str]] = [
-    ["2024-03-01", "2024-05-15"],
-    ["2025-03-01", "2025-05-15"],
-    ["2026-03-01", "2026-05-15"],
+    ["2026-03-01", "2026-05-01"],
 ]
 
 WET_WINDOWS: List[List[str]] = [
-    ["2023-07-01", "2023-09-15"],
-    ["2024-07-01", "2024-09-15"],
-    ["2025-07-01", "2025-09-15"],
+    ["2026-07-01", "2026-10-01"],
 ]
 
-# 2026 dry season: use only 1 Sentinel-2 scene across Mar–May
+# 2026 dry season: use only 1 Sentinel-2 scene across the dry window
 DRY_2026_SINGLE_IMAGE = True
+DRY_2026_START, DRY_2026_END = DRY_WINDOWS[-1]
 
 MNDWI_WATER_THRESHOLD = 0.05
 NDVI_WATER_MAX = 0.35
@@ -210,20 +208,20 @@ def _limit_2026_dry_to_one_image(
     If 2026 has no imagery, substitute one scene from 2025 Mar–May.
     Other dry-window scenes (2024, 2025 full windows) are unchanged.
     """
-    pre_2026 = collection.filterDate("2024-03-01", "2026-03-01")
-    note = "2026 dry: 1 Sentinel-2 image (Mar–May)"
+    pre_2026 = collection.filterDate("2024-03-01", DRY_2026_START)
+    note = "2026 dry: 1 Sentinel-2 image (Mar–Apr)"
 
     if not DRY_2026_SINGLE_IMAGE:
         return collection, note
 
     dry_2026 = (
-        collection.filterDate("2026-03-01", "2026-05-15")
+        collection.filterDate(DRY_2026_START, DRY_2026_END)
         .sort("CLOUDY_PIXEL_PERCENTAGE")
         .limit(1)
     )
     n2026 = int(dry_2026.size().getInfo() or 0)
     if n2026 == 0:
-        dry_2026 = collection.filterDate("2026-03-01", "2026-05-15").limit(1)
+        dry_2026 = collection.filterDate(DRY_2026_START, DRY_2026_END).limit(1)
         n2026 = int(dry_2026.size().getInfo() or 0)
 
     if n2026 == 0:
@@ -566,8 +564,8 @@ def analyze_fishing_points(
     """
     Run fishing suitability → robust hotspots → lat/lon points + one KML.
 
-    Dry: Mar–May windows (2024–2026); wet: Jul–Sep (2023–2025).
-    For 2026 dry Mar–May, only one Sentinel-2 image is used.
+    Dry: Mar–Apr 2026; wet: Jul–Sep 2026.
+    For 2026 dry Mar–Apr, only one Sentinel-2 image is used.
     """
     access_points = access_points or _sample_access_along_aoi(aoi)
 
@@ -582,13 +580,13 @@ def analyze_fishing_points(
     wet_count = int(wet_masked.size().getInfo() or 0)
     if dry_count == 0:
         raise ValueError(
-            "No cloud-masked Sentinel-2 scenes found in dry windows "
-            "(Mar–May 2024–2026) over the KML area."
+            "No cloud-masked Sentinel-2 scenes found in the dry window "
+            "(Mar–Apr 2026) over the KML area."
         )
     if wet_count == 0:
         raise ValueError(
-            "No cloud-masked Sentinel-2 scenes found in wet windows "
-            "(Jul–Sep 2023–2025) over the KML area."
+            "No cloud-masked Sentinel-2 scenes found in the wet window "
+            "(Jul–Sep 2026) over the KML area."
         )
 
     dry_composite = dry_masked.median().clip(aoi_buffered)

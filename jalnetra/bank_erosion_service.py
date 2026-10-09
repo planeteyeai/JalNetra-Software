@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 from xml.dom import minidom
@@ -15,6 +14,7 @@ from xml.dom import minidom
 import ee
 from shapely.geometry import MultiPolygon, Polygon
 
+from jalnetra.ee_http import read_url
 from jalnetra.kml_buffer import (
     _geom_to_ee,
     _line_coords_for_kml,
@@ -256,14 +256,12 @@ def _export_overlay_png(vis_image: ee.Image, geometry: ee.Geometry) -> bytes:
     }
     try:
         url = vis_image.getDownloadURL(download_params)
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
     except Exception:
         url = vis_image.getThumbURL(
             {"region": geometry, "scale": export_scale, "format": "png"}
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
 
 
 def _kml_el(parent: ET.Element, tag: str, text: Optional[str] = None) -> ET.Element:

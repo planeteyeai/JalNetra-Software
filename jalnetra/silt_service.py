@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -18,6 +17,7 @@ from xml.dom import minidom
 import ee
 from shapely.geometry import MultiPolygon, Polygon
 
+from jalnetra.ee_http import read_url
 from jalnetra.kml_buffer import (
     _geom_to_ee,
     _line_coords_for_kml,
@@ -35,6 +35,17 @@ MAX_EXPORT_PIXELS = 12_000_000
 MAX_PIXELS = 1e13
 TILE_SCALE = 4
 KML_OVERLAY_COLOR = "ffffffff"
+MAX_CLOUD_S2 = 40
+
+# Silt volume surface = silt score × pixel area (10 m grid, EPSG:4326) × layer
+# thickness. Matches the reference "Silt Volume Surface" KMZs (0–94.31 scale
+# over Pune = one 10 m EPSG:4326 pixel area in m²).
+VOLUME_PIXEL_SCALE_M = 10
+SILT_LAYER_THICKNESS_M = 1.0
+VOLUME_PALETTE = [  # ColorBrewer YlOrBr (earth tone)
+    "FFFFE5", "FFF7BC", "FEE391", "FEC44F", "FE9929",
+    "EC7014", "CC4C02", "993404", "662506",
+]
 
 _MONTH_NAMES = [
     "January",
@@ -221,6 +232,39 @@ def _silt_vis_image(
     )
 
 
+def _volume_pixel_area() -> ee.Image:
+    return ee.Image.pixelArea().reproject(
+        crs="EPSG:4326", scale=VOLUME_PIXEL_SCALE_M
+    )
+
+
+def _volume_color_max(aoi: ee.Geometry) -> float:
+    """Shared colour-scale max = largest possible pixel volume (score = 1)."""
+    stats = _volume_pixel_area().reduceRegion(
+        reducer=ee.Reducer.max(),
+        geometry=aoi,
+        scale=VOLUME_PIXEL_SCALE_M,
+        maxPixels=MAX_PIXELS,
+        bestEffort=True,
+        tileScale=TILE_SCALE,
+    ).getInfo() or {}
+    area = float(stats.get("area", 0) or 0) or float(VOLUME_PIXEL_SCALE_M**2)
+    return round(area * SILT_LAYER_THICKNESS_M, 2)
+
+
+def _silt_volume_vis_image(
+    silt_volume: ee.Image, water: ee.Image, aoi: ee.Geometry, vmax: float
+) -> ee.Image:
+    """Continuous volume surface on water only (YlOrBr, fixed 0–vmax scale)."""
+    export_scale = _export_scale_for_geometry(aoi)
+    water_smooth = _smooth_water_mask(water.clip(aoi))
+    masked = silt_volume.clip(aoi).updateMask(water_smooth)
+    scaled = masked.reproject(crs="EPSG:4326", scale=export_scale)
+    return scaled.visualize(min=0, max=vmax, palette=VOLUME_PALETTE).updateMask(
+        scaled.mask()
+    )
+
+
 def _export_overlay_png(vis_image: ee.Image, geometry: ee.Geometry) -> bytes:
     export_scale = _export_scale_for_geometry(geometry)
     download_params: Dict[str, Any] = {
@@ -231,14 +275,12 @@ def _export_overlay_png(vis_image: ee.Image, geometry: ee.Geometry) -> bytes:
     }
     try:
         url = vis_image.getDownloadURL(download_params)
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
     except Exception:
         url = vis_image.getThumbURL(
             {"region": geometry, "scale": export_scale, "format": "png"}
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
 
 
 def _kml_el(parent: ET.Element, tag: str, text: Optional[str] = None) -> ET.Element:
@@ -287,6 +329,7 @@ def _process_month(
     box: Dict[str, float],
     year: int,
     end_day_exclusive: Optional[ee.Date] = None,
+    volume_vmax: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     start_date = ee.Date.fromYMD(year, month_number, 1)
     end_date = start_date.advance(1, "month")
@@ -303,6 +346,7 @@ def _process_month(
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(aoi)
         .filterDate(start_date, end_date)
+        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_S2))
     )
     s2_count = int(raw_s2.size().getInfo() or 0)
     if s2_count == 0:
@@ -392,6 +436,51 @@ def _process_month(
         legend_lines=["SILT CLASSIFICATION", *legend],
     )
 
+    # ---- Silt volume surface (new layer; classification above unchanged) ----
+    vmax = volume_vmax or float(VOLUME_PIXEL_SCALE_M**2) * SILT_LAYER_THICKNESS_M
+    silt_volume = (
+        silt_score.multiply(_volume_pixel_area())
+        .multiply(SILT_LAYER_THICKNESS_M)
+        .rename("Silt_Volume")
+    )
+    volume_total = silt_score.multiply(ee.Image.pixelArea()).multiply(
+        SILT_LAYER_THICKNESS_M
+    ).rename("Silt_Volume_Total").reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=SCALE,
+        maxPixels=MAX_PIXELS,
+        bestEffort=True,
+        tileScale=TILE_SCALE,
+    ).getInfo() or {}
+    total_volume_m3 = float(volume_total.get("Silt_Volume_Total", 0) or 0)
+    volume_png = _export_overlay_png(
+        _silt_volume_vis_image(silt_volume, water, aoi, vmax), aoi
+    )
+    volume_kml_filename = (
+        f"silt_volume_{year}_{month_code}_{month_name.lower()}.kml"
+    )
+    volume_kml_bytes = _build_kml(
+        title=f"Silt Volume Surface — {month_name} {year}",
+        description=(
+            f"Silt volume surface · {month_name} {year}\n"
+            f"Volume per {VOLUME_PIXEL_SCALE_M} m pixel = silt score × pixel area × "
+            f"{SILT_LAYER_THICKNESS_M} m assumed layer thickness\n"
+            f"Colour scale fixed 0–{vmax} (shared across all months)\n"
+            f"Total relative silt volume: {round(total_volume_m3, 1)} m³\n"
+            "Relative index volume — not surveyed sediment volume."
+        ),
+        box=box,
+        overlay_name=f"{month_name} {year} Silt Volume",
+        png_bytes=volume_png,
+        legend_lines=[
+            "SILT VOLUME SURFACE (YlOrBr)",
+            "#FFFFE5  0.00",
+            f"#FE9929  {round(vmax / 2, 2)}",
+            f"#662506  {vmax}",
+        ],
+    )
+
     return {
         "month": month_name,
         "month_number": month_number,
@@ -409,6 +498,15 @@ def _process_month(
         "export_scale_m": _export_scale_for_geometry(aoi),
         "kml_bytes": kml_bytes,
         "kml_filename": f"silt_{year}_{month_code}_{month_name.lower()}.kml",
+        "silt_volume": {
+            "total_volume_m3": round(total_volume_m3, 2),
+            "pixel_scale_m": VOLUME_PIXEL_SCALE_M,
+            "assumed_layer_thickness_m": SILT_LAYER_THICKNESS_M,
+            "color_scale": {"min": 0.0, "max": vmax},
+            "palette": VOLUME_PALETTE,
+            "kml_filename": volume_kml_filename,
+        },
+        "volume_kml_bytes": volume_kml_bytes,
     }
 
 
@@ -432,6 +530,7 @@ def analyze_silt(
         float(aoi_geometry.area(1).divide(10000).getInfo()), 2
     )
     box = _aoi_box(aoi_geometry)
+    volume_vmax = _volume_color_max(aoi_geometry)
 
     monthly: Dict[str, Dict[str, Any]] = {}
     skipped: List[str] = []
@@ -450,6 +549,7 @@ def analyze_silt(
                     if num == today.month and today.year == YEAR
                     else None
                 ),
+                volume_vmax=volume_vmax,
             ): name
             for num, name in months
         }
@@ -474,7 +574,11 @@ def analyze_silt(
         if key not in monthly:
             continue
         layer = monthly[key]
-        months_out[key] = {k: v for k, v in layer.items() if k != "kml_bytes"}
+        months_out[key] = {
+            k: v
+            for k, v in layer.items()
+            if k not in ("kml_bytes", "volume_kml_bytes")
+        }
         combined_rows.append(
             {
                 "year": YEAR,
@@ -482,6 +586,7 @@ def analyze_silt(
                 "month_number": num,
                 "water_area_ha": layer["water_area_ha"],
                 "mean_silt_score": layer["mean_silt_score"],
+                "total_silt_volume_m3": layer["silt_volume"]["total_volume_m3"],
                 "categories": layer["categories"],
             }
         )
@@ -513,6 +618,7 @@ def analyze_silt(
 
     for key, layer in monthly.items():
         result[f"{key}_kml_bytes"] = layer["kml_bytes"]
+        result[f"{key}_volume_kml_bytes"] = layer["volume_kml_bytes"]
 
     if aoi_info:
         result["aoi"] = aoi_info

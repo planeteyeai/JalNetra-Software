@@ -17,10 +17,12 @@ Vegetation type/health uses Sentinel-2 + Dynamic World (GEE).
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import socket
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -63,20 +65,13 @@ from jalnetra.water_quality_service import (
     analyze_water_quality,
     water_quality_geometry,
 )
-<<<<<<< HEAD
-from jalnetra.water_depth_service import analyze_live_water_depth  # noqa: E402
-from jalnetra.vegetation_service import (  # noqa: E402
-=======
+from jalnetra.water_depth_service import analyze_live_water_depth
 from jalnetra.vegetation_service import (
->>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
     analyze_vegetation_health,
     analyze_vegetation_type,
-    default_date_range,
 )
-<<<<<<< HEAD
-from jalnetra.kml_pixel_smoother import smooth_kml_bytes  # noqa: E402
-=======
->>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
+from jalnetra.kml_pixel_smoother import smooth_kml_bytes
+from jalnetra.scene_dates import recent_window, select_clear_s2_date
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -174,16 +169,6 @@ app.add_middleware(
 )
 
 
-def _parse_date(label: str, value: str) -> str:
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid {label}: use YYYY-MM-DD format.",
-        ) from exc
-
-
 def _geojson_centroid(geojson: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """Return (latitude, longitude) from GeoJSON polygon geometry."""
     if not geojson:
@@ -255,14 +240,10 @@ async def root() -> Dict[str, Any]:
             "POST /api/flood-water, POST /api/bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
-<<<<<<< HEAD
             "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, POST /api/silt, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
-            "POST /api/copernicus-dsm"
-=======
-            "POST /api/water-quality, POST /api/lithology, POST /api/silt, "
-            "POST /api/fishing-point, POST /api/fabdem-dtm"
->>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
+            "POST /api/copernicus-dsm, "
+            "POST /api/all (one KML -> every API)"
         ),
         "ngrok_free_tier": (
             "Browser: click 'Visit Site' once on the ngrok warning page, then use /docs. "
@@ -297,27 +278,29 @@ def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str,
     return result
 
 
+FLOOD_DEFAULT_START_DATE = "2026-06-01"
+
+
 @app.post("/api/flood-water")
 async def flood_water(
     request: Request,
     kml: UploadFile = File(..., description="KML file with region boundary"),
-    start_date: str = Form(..., description="Range start (YYYY-MM-DD)"),
-    end_date: str = Form(..., description="Range end (YYYY-MM-DD)"),
 ) -> Dict[str, Any]:
     """
-    Upload KML + date range → per-image flood/water areas and smoothed KMLs.
+    Upload KML → per-image flood/water areas and smoothed KMLs.
 
+    No date input: fixed range 1 June 2026 → today.
     50 m border buffer. Pre/post dates follow Sentinel-1 image sequence.
     No Excel / lat-lon points — class-wise water and flood hectares only.
     """
     _require_earth_engine()
 
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
+    start_date = FLOOD_DEFAULT_START_DATE
+    end_date = datetime.now().strftime("%Y-%m-%d")
     if start_date >= end_date:
         raise HTTPException(
             status_code=400,
-            detail="start_date must be before end_date.",
+            detail=f"Flood range start {start_date} must be before today ({end_date}).",
         )
 
     kml_bytes = await kml.read()
@@ -459,11 +442,29 @@ def _kml_geometry_from_bytes(kml_bytes: bytes):
     return kml_bytes_to_ee_geometry(kml_bytes)
 
 
-def _vegetation_response(
-    request: Request, result: Dict[str, Any], *, prefix: str, filename: str
-) -> Dict[str, Any]:
+def _store_smoothed_kml(kml_bytes: bytes) -> str:
+    """Pixel-smooth GroundOverlay PNGs (kml_pixel_smoother) and cache the KML."""
     kml_id = uuid.uuid4().hex
-    _KML_CACHE[kml_id] = result.pop("kml_bytes")
+    try:
+        _KML_CACHE[kml_id] = smooth_kml_bytes(kml_bytes)
+    except Exception:
+        _KML_CACHE[kml_id] = kml_bytes
+    return kml_id
+
+
+def _vegetation_response(
+    request: Request,
+    result: Dict[str, Any],
+    *,
+    prefix: str,
+    filename: str,
+    smooth: bool = True,
+) -> Dict[str, Any]:
+    if smooth:
+        kml_id = _store_smoothed_kml(result.pop("kml_bytes"))
+    else:
+        kml_id = uuid.uuid4().hex
+        _KML_CACHE[kml_id] = result.pop("kml_bytes")
     result["kml_id"] = kml_id
     result["kml_download_url"] = _public_url(
         request, f"/api/{prefix}/kml/{kml_id}"
@@ -481,8 +482,7 @@ def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[st
         "ndci": ("ndci_kml_bytes", "ndci_chlorophyll.kml"),
     }
     for layer_key, (bytes_key, filename) in layers.items():
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result[layer_key]["kml_id"] = kml_id
         result[layer_key]["kml_download_url"] = _public_url(
             request, f"/api/water-quality/kml/{kml_id}"
@@ -492,19 +492,27 @@ def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[st
 
 
 def _silt_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach KML download URLs for each month that has imagery."""
+    """Attach classification + volume KML download URLs for each month with imagery."""
     for key in list(result.get("months") or {}):
         bytes_key = f"{key}_kml_bytes"
         if bytes_key not in result:
             continue
         filename = result["months"][key].get("kml_filename", f"silt_{key}.kml")
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result["months"][key]["kml_id"] = kml_id
         result["months"][key]["kml_download_url"] = _public_url(
             request, f"/api/silt/kml/{kml_id}"
         )
         result["months"][key]["kml_filename"] = filename
+
+        volume_key = f"{key}_volume_kml_bytes"
+        volume = result["months"][key].get("silt_volume")
+        if volume_key in result and volume is not None:
+            volume_id = _store_smoothed_kml(result.pop(volume_key))
+            volume["kml_id"] = volume_id
+            volume["kml_download_url"] = _public_url(
+                request, f"/api/silt/kml/{volume_id}"
+            )
     return result
 
 
@@ -538,8 +546,7 @@ def _lulc_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
         if bytes_key not in result:
             continue
         filename = result["years"][year_key].get("kml_filename", f"lulc_{year}.kml")
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result["years"][year_key]["kml_id"] = kml_id
         result["years"][year_key]["kml_download_url"] = _public_url(
             request, f"/api/lulc/kml/{kml_id}"
@@ -557,28 +564,14 @@ def _vegetation_geometry(kml_bytes: bytes):
 async def vegetation_type(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary"),
-    start_date: Optional[str] = Form(
-        None, description="Start date YYYY-MM-DD (default: ~31 days ago)"
-    ),
-    end_date: Optional[str] = Form(
-        None, description="End date YYYY-MM-DD (default: today)"
-    ),
 ) -> Dict[str, Any]:
     """
     Upload KML → vegetation type map inside a rectangle (KML bounds + 2 km buffer).
 
+    No date input: uses the nearest clear Sentinel-2 date in the last 30 days.
     Returns area (ha) and % of analysis area per class, plus downloadable KML overlay.
     """
     _require_earth_engine()
-
-    if not start_date or not end_date:
-        default_start, default_end = default_date_range()
-        start_date = start_date or default_start
-        end_date = end_date or default_end
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
-    if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -588,11 +581,14 @@ async def vegetation_type(
         analysis_geom, _input_geom, buffer_info = await asyncio.to_thread(
             _vegetation_geometry, kml_bytes
         )
+        scene = await asyncio.to_thread(
+            select_clear_s2_date, analysis_geom, require_dynamic_world=True
+        )
         result = await asyncio.to_thread(
             analyze_vegetation_type,
             analysis_geom,
-            start_date,
-            end_date,
+            scene["start_date"],
+            scene["end_date"],
             buffer_info=buffer_info,
         )
     except ValueError as exc:
@@ -602,8 +598,13 @@ async def vegetation_type(
             status_code=500, detail=f"Vegetation type analysis failed: {exc}"
         ) from exc
 
-    return _vegetation_response(
-        request, result, prefix="vegetation-type", filename="vegetation_type.kml"
+    result["scene_selection"] = scene
+    return await asyncio.to_thread(
+        _vegetation_response,
+        request,
+        result,
+        prefix="vegetation-type",
+        filename="vegetation_type.kml",
     )
 
 
@@ -626,28 +627,14 @@ async def download_vegetation_type_kml(kml_id: str) -> Response:
 async def vegetation_health(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary"),
-    start_date: Optional[str] = Form(
-        None, description="Start date YYYY-MM-DD (default: ~31 days ago)"
-    ),
-    end_date: Optional[str] = Form(
-        None, description="End date YYYY-MM-DD (default: today)"
-    ),
 ) -> Dict[str, Any]:
     """
     Upload KML → vegetation health map inside a rectangle (KML bounds + 2 km buffer).
 
+    No date input: uses the nearest clear Sentinel-2 date in the last 30 days.
     Returns area (ha) and % of total vegetation per health class, plus downloadable KML.
     """
     _require_earth_engine()
-
-    if not start_date or not end_date:
-        default_start, default_end = default_date_range()
-        start_date = start_date or default_start
-        end_date = end_date or default_end
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
-    if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -657,11 +644,14 @@ async def vegetation_health(
         analysis_geom, _input_geom, buffer_info = await asyncio.to_thread(
             _vegetation_geometry, kml_bytes
         )
+        scene = await asyncio.to_thread(
+            select_clear_s2_date, analysis_geom, require_dynamic_world=True
+        )
         result = await asyncio.to_thread(
             analyze_vegetation_health,
             analysis_geom,
-            start_date,
-            end_date,
+            scene["start_date"],
+            scene["end_date"],
             buffer_info=buffer_info,
         )
     except ValueError as exc:
@@ -671,8 +661,13 @@ async def vegetation_health(
             status_code=500, detail=f"Vegetation health analysis failed: {exc}"
         ) from exc
 
-    return _vegetation_response(
-        request, result, prefix="vegetation-health", filename="vegetation_health.kml"
+    result["scene_selection"] = scene
+    return await asyncio.to_thread(
+        _vegetation_response,
+        request,
+        result,
+        prefix="vegetation-health",
+        filename="vegetation_health.kml",
     )
 
 
@@ -725,7 +720,7 @@ async def lulc(
             status_code=500, detail=f"LULC analysis failed: {exc}"
         ) from exc
 
-    return _lulc_response(request, result)
+    return await asyncio.to_thread(_lulc_response, request, result)
 
 
 @app.get("/api/lulc/kml/{kml_id}")
@@ -747,21 +742,15 @@ async def download_lulc_kml(kml_id: str) -> Response:
 async def salinity(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary"),
-    start_date: str = Form(..., description="Start date YYYY-MM-DD"),
-    end_date: str = Form(..., description="End date YYYY-MM-DD"),
 ) -> Dict[str, Any]:
     """
-    Upload KML + date range → relative salinity index (0–1) over water pixels.
+    Upload KML → relative salinity index (0–1) over water pixels.
 
-    Uses latest Sentinel-2 + Dynamic World in the date window.
+    No date input: uses the nearest clear Sentinel-2 date (≤40% cloud) in the
+    last 30 days, with its matching Dynamic World image.
     Returns class-wise salinity range status (JSON) and downloadable KML overlay.
     """
     _require_earth_engine()
-
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
-    if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -769,11 +758,14 @@ async def salinity(
 
     try:
         aoi_geom, aoi_info = await asyncio.to_thread(salinity_geometry, kml_bytes)
+        scene = await asyncio.to_thread(
+            select_clear_s2_date, aoi_geom, require_dynamic_world=True
+        )
         result = await asyncio.to_thread(
             analyze_salinity,
             aoi_geom,
-            start_date,
-            end_date,
+            scene["start_date"],
+            scene["end_date"],
             aoi_info=aoi_info,
         )
     except ValueError as exc:
@@ -783,8 +775,13 @@ async def salinity(
             status_code=500, detail=f"Salinity analysis failed: {exc}"
         ) from exc
 
-    return _vegetation_response(
-        request, result, prefix="salinity", filename="relative_salinity.kml"
+    result["scene_selection"] = scene
+    return await asyncio.to_thread(
+        _vegetation_response,
+        request,
+        result,
+        prefix="salinity",
+        filename="relative_salinity.kml",
     )
 
 
@@ -834,7 +831,8 @@ async def bank_erosion(
             status_code=500, detail=f"Bank erosion analysis failed: {exc}"
         ) from exc
 
-    return _vegetation_response(
+    return await asyncio.to_thread(
+        _vegetation_response,
         request,
         result,
         prefix="bank-erosion",
@@ -865,21 +863,16 @@ async def download_bank_erosion_kml(kml_id: str) -> Response:
 async def water_quality(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
-    start_date: str = Form(..., description="Start date YYYY-MM-DD"),
-    end_date: str = Form(..., description="End date YYYY-MM-DD"),
 ) -> Dict[str, Any]:
     """
-    Upload KML + date range → four water quality KML layers.
+    Upload KML → four water quality KML layers.
 
     Returns WST, TSS (turbidity), NDWI (permanent water), and NDCI (chlorophyll).
-    No buffer. Uses latest Sentinel-2 + Dynamic World; Landsat 9 for WST.
+    No date input: Sentinel-2 + Dynamic World use the nearest clear date in the
+    last 30 days; Landsat 9 WST uses the median of that same 30-day window.
+    No buffer.
     """
     _require_earth_engine()
-
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
-    if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -887,12 +880,16 @@ async def water_quality(
 
     try:
         aoi_geom, aoi_info = await asyncio.to_thread(water_quality_geometry, kml_bytes)
+        scene = await asyncio.to_thread(
+            select_clear_s2_date, aoi_geom, require_dynamic_world=True
+        )
         result = await asyncio.to_thread(
             analyze_water_quality,
             aoi_geom,
-            start_date,
-            end_date,
+            scene["start_date"],
+            scene["end_date"],
             aoi_info=aoi_info,
+            landsat_window=recent_window(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -901,7 +898,8 @@ async def water_quality(
             status_code=500, detail=f"Water quality analysis failed: {exc}"
         ) from exc
 
-    return _water_quality_response(request, result)
+    result["scene_selection"] = scene
+    return await asyncio.to_thread(_water_quality_response, request, result)
 
 
 @app.get("/api/water-quality/kml/{kml_id}")
@@ -917,20 +915,36 @@ async def download_water_quality_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_quality.kml"'},
     )
-<<<<<<< HEAD
 
 
 @app.post("/api/water-depth")
 async def water_depth(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary"),
+    depth_min_m: Optional[float] = Form(
+        None, description="Minimum depth in metres (default: WATER_DEPTH_MIN_M or 1.5)"
+    ),
+    depth_max_m: Optional[float] = Form(
+        None, description="Maximum depth in metres (default: WATER_DEPTH_MAX_M or 2.0)"
+    ),
 ) -> Dict[str, Any]:
     """
     Upload KML → two downloadable KMLs: blue permanent/SAR water and relative depth.
 
+    No date input: Sentinel-1 and Sentinel-2 each use the nearest clear image
+    date in the last 30 days. Optional min/max depth set the depth scale.
     Response includes the actual Sentinel-1 and Sentinel-2 image dates used.
     """
     _require_earth_engine()
+
+    if (
+        depth_min_m is not None
+        and depth_max_m is not None
+        and depth_max_m <= depth_min_m
+    ):
+        raise HTTPException(
+            status_code=400, detail="depth_max_m must be greater than depth_min_m."
+        )
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -938,7 +952,9 @@ async def water_depth(
 
     try:
         aoi_geom = await asyncio.to_thread(_kml_geometry_from_bytes, kml_bytes)
-        result = await asyncio.to_thread(analyze_live_water_depth, aoi_geom)
+        result = await asyncio.to_thread(
+            analyze_live_water_depth, aoi_geom, depth_min_m, depth_max_m
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -946,7 +962,7 @@ async def water_depth(
             status_code=500, detail=f"Water depth analysis failed: {exc}"
         ) from exc
 
-    return _water_depth_response(request, result)
+    return await asyncio.to_thread(_water_depth_response, request, result)
 
 
 @app.get("/api/water-depth/kml/{kml_id}")
@@ -962,31 +978,23 @@ async def download_water_depth_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_depth.kml"'},
     )
-=======
->>>>>>> 3e6b88e240eaea9f66df96c63a732b8b498d1cf5
 
 
 @app.post("/api/lithology")
 async def lithology(
     request: Request,
     kml: UploadFile = File(..., description="KML AOI boundary"),
-    start_date: str = Form(..., description="Start date YYYY-MM-DD"),
-    end_date: str = Form(..., description="End date YYYY-MM-DD"),
 ) -> Dict[str, Any]:
     """
-    Upload KML + date range → lithological spectral interpretation map.
+    Upload KML → lithological spectral interpretation map.
 
+    No date input: uses the nearest clear Sentinel-2 date in the last 30 days.
     Analysis uses a 50 m buffer from the KML border.
-    Sentinel-2 dry-season median, K-Means clustering, silt class 0 and
-    eight lithology spectral clusters (1–8). Returns class areas (ha) and
-    percent of classified area, plus downloadable smoothed KML overlay.
+    K-Means clustering, silt class 0 and eight lithology spectral clusters
+    (1–8). Returns class areas (ha) and percent of classified area, plus
+    downloadable KML overlay.
     """
     _require_earth_engine()
-
-    start_date = _parse_date("start_date", start_date)
-    end_date = _parse_date("end_date", end_date)
-    if start_date >= end_date:
-        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
 
     kml_bytes = await kml.read()
     if not kml_bytes:
@@ -996,12 +1004,14 @@ async def lithology(
         analysis_geom, _input_geom, buffer_info = await asyncio.to_thread(
             lithology_geometry, kml_bytes
         )
+        scene = await asyncio.to_thread(select_clear_s2_date, analysis_geom)
         result = await asyncio.to_thread(
             analyze_lithology,
             analysis_geom,
-            start_date,
-            end_date,
+            scene["start_date"],
+            scene["end_date"],
             buffer_info=buffer_info,
+            dry_season_only=False,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1010,8 +1020,9 @@ async def lithology(
             status_code=500, detail=f"Lithology analysis failed: {exc}"
         ) from exc
 
+    result["scene_selection"] = scene
     return _vegetation_response(
-        request, result, prefix="lithology", filename="lithology.kml"
+        request, result, prefix="lithology", filename="lithology.kml", smooth=False
     )
 
 
@@ -1062,7 +1073,7 @@ async def silt(
             status_code=500, detail=f"Silt analysis failed: {exc}"
         ) from exc
 
-    return _silt_response(request, result)
+    return await asyncio.to_thread(_silt_response, request, result)
 
 
 @app.get("/api/silt/kml/{kml_id}")
@@ -1173,6 +1184,14 @@ async def fabdem_dtm(
     result["tif_download_url"] = _public_url(
         request, f"/api/fabdem-dtm/tif/{tif_id}"
     )
+    raw_bytes = result.pop("raw_tif_bytes", None)
+    if raw_bytes is not None:
+        raw_id = uuid.uuid4().hex
+        _TIF_CACHE[raw_id] = raw_bytes
+        result["raw_tif_id"] = raw_id
+        result["raw_tif_download_url"] = _public_url(
+            request, f"/api/fabdem-dtm/tif/{raw_id}"
+        )
     return result
 
 
@@ -1193,6 +1212,115 @@ async def download_fabdem_dtm_tif(tif_id: str) -> Response:
             )
         },
     )
+
+
+ALL_APIS_MAX_CONCURRENCY = int(os.environ.get("ALL_APIS_MAX_CONCURRENCY", "2"))
+ALL_API_NAMES = (
+    "flood_water",
+    "bod_cod",
+    "vegetation_type",
+    "vegetation_health",
+    "lulc",
+    "salinity",
+    "bank_erosion",
+    "water_quality",
+    "water_depth",
+    "lithology",
+    "silt",
+    "fishing_point",
+    "fabdem_dtm",
+)
+
+
+@app.post("/api/all")
+async def all_apis(
+    request: Request,
+    kml: UploadFile = File(..., description="One KML AOI used for every API"),
+    depth_min_m: Optional[float] = Form(
+        None, description="Water-depth minimum depth in metres (optional)"
+    ),
+    depth_max_m: Optional[float] = Form(
+        None, description="Water-depth maximum depth in metres (optional)"
+    ),
+    apis: Optional[str] = Form(
+        None,
+        description=(
+            "Optional comma-separated subset, e.g. 'salinity,silt'. "
+            f"Default: all ({', '.join(ALL_API_NAMES)})"
+        ),
+    ),
+) -> Dict[str, Any]:
+    """
+    Upload ONE KML → run every JalNetra API and return all responses + KML URLs.
+
+    Each API runs through its own endpoint unchanged; one failing API does not
+    stop the others (its entry has status "error"). KML / TIFF download URLs
+    in each result are the same as from the individual endpoints.
+    """
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+    filename = kml.filename or "aoi.kml"
+
+    def upload() -> UploadFile:
+        return UploadFile(file=io.BytesIO(kml_bytes), filename=filename)
+
+    jobs = {
+        "flood_water": lambda: flood_water(request, upload()),
+        "bod_cod": lambda: bod_cod(request, upload()),
+        "vegetation_type": lambda: vegetation_type(request, upload()),
+        "vegetation_health": lambda: vegetation_health(request, upload()),
+        "lulc": lambda: lulc(request, upload()),
+        "salinity": lambda: salinity(request, upload()),
+        "bank_erosion": lambda: bank_erosion(request, upload()),
+        "water_quality": lambda: water_quality(request, upload()),
+        "water_depth": lambda: water_depth(
+            request, upload(), depth_min_m, depth_max_m
+        ),
+        "lithology": lambda: lithology(request, upload()),
+        "silt": lambda: silt(request, upload()),
+        "fishing_point": lambda: fishing_point(request, upload()),
+        "fabdem_dtm": lambda: fabdem_dtm(request, upload()),
+    }
+
+    selected = list(ALL_API_NAMES)
+    if apis:
+        selected = [a.strip() for a in apis.split(",") if a.strip()]
+        unknown = [a for a in selected if a not in jobs]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown api name(s): {unknown}. Valid: {list(ALL_API_NAMES)}",
+            )
+
+    semaphore = asyncio.Semaphore(max(1, ALL_APIS_MAX_CONCURRENCY))
+
+    async def _run(name: str) -> Tuple[str, Dict[str, Any]]:
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                data = await jobs[name]()
+                entry: Dict[str, Any] = {"status": "ok", "result": data}
+            except HTTPException as exc:
+                entry = {
+                    "status": "error",
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                }
+            except Exception as exc:
+                entry = {"status": "error", "status_code": 500, "detail": str(exc)}
+            entry["elapsed_s"] = round(time.perf_counter() - started, 1)
+            return name, entry
+
+    pairs = await asyncio.gather(*(_run(name) for name in selected))
+    results = dict(pairs)
+    return {
+        "kml_filename": filename,
+        "api_count": len(selected),
+        "succeeded": [n for n in selected if results[n]["status"] == "ok"],
+        "failed": [n for n in selected if results[n]["status"] != "ok"],
+        "results": results,
+    }
 
 
 if __name__ == "__main__":

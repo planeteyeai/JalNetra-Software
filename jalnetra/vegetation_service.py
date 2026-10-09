@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,11 +14,14 @@ from xml.dom import minidom
 
 import ee
 
+from jalnetra.ee_http import read_url
+
 KML_NS = "http://www.opengis.net/kml/2.2"
 SCALE = 10  # Sentinel-2 native resolution (metres)
 DISPLAY_SCALE_M = 5  # 2× supersample for smoother appearance when zoomed in
 SMOOTH_RADIUS_M = 10  # 1-pixel majority filter at native resolution
 MAX_EXPORT_PIXELS = 12_000_000
+MAX_CLOUD_S2 = 40
 
 # Map overlay palettes — vegetation pixels only (non-veg = transparent)
 TYPE_PALETTE_VEG = ["006400", "8B4513", "7CFC00", "800080"]
@@ -161,14 +163,12 @@ def _export_overlay_png(vis_image: ee.Image, geometry: ee.Geometry) -> bytes:
     }
     try:
         url = vis_image.getDownloadURL(download_params)
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
     except Exception:
         url = vis_image.getThumbURL(
             {"region": geometry, "scale": export_scale, "format": "png"}
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
 
 
 def _thumb_png(image: ee.Image, geometry: ee.Geometry, dimensions: int = 1200) -> bytes:
@@ -272,7 +272,7 @@ def _build_vegetation_stack(
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(analysis_area)
         .filterDate(start_date, end_date)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
+        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_S2))
         .map(_mask_s2)
     )
     if int(s2.size().getInfo() or 0) == 0:

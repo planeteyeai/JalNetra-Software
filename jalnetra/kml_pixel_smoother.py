@@ -36,6 +36,8 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
+# Upscaled overlay size cap (keeps API memory and embedded-KML size bounded).
+MAX_SMOOTHED_PIXELS = 24_000_000
 
 # --------------------------------------------------------------------------
 # HSV helpers (avoid hard matplotlib dependency for the API path)
@@ -276,14 +278,14 @@ def smooth_rgba_png(
     bleeding colour into transparent background.
     """
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-    arr = np.asarray(img).astype(np.float64)
+    arr = np.asarray(img).astype(np.float32)
     rgb = arr[..., :3]
     alpha = arr[..., 3] / 255.0
-    coverage = (alpha > 0.01).astype(np.float64)
+    coverage = (alpha > 0.01).astype(np.float32)
 
     # Prefer alpha as coverage when present; else opaque non-black pixels
     if float(alpha.max()) < 0.01:
-        coverage = (np.any(rgb > 2.0, axis=-1)).astype(np.float64)
+        coverage = (np.any(rgb > 2.0, axis=-1)).astype(np.float32)
         alpha = coverage.copy()
 
     cov = np.maximum(coverage * np.maximum(alpha, coverage), 0.0)
@@ -320,6 +322,10 @@ def smooth_rgba_png(
     ]).astype(np.uint8)
 
     out_img = Image.fromarray(out, mode="RGBA")
+    while upscale and upscale > 1 and (
+        out_img.width * out_img.height * upscale * upscale > MAX_SMOOTHED_PIXELS
+    ):
+        upscale -= 1
     if upscale and upscale != 1:
         out_img = out_img.resize(
             (out_img.width * upscale, out_img.height * upscale),

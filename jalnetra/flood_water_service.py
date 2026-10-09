@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 import math
-import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +18,7 @@ from xml.dom import minidom
 
 import ee
 
+from jalnetra.ee_http import read_url
 from jalnetra.flood_deps.flood_service import (
     _build_classification,
     _compute_flood_water_areas_ha,
@@ -107,14 +107,12 @@ def _export_overlay_png(vis_image: ee.Image, geometry: ee.Geometry) -> bytes:
                 "format": "PNG",
             }
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
     except Exception:
         url = vis_image.getThumbURL(
             {"region": geometry, "scale": export_scale, "format": "png"}
         )
-        with urllib.request.urlopen(url, timeout=900) as resp:
-            return resp.read()
+        return read_url(url, timeout=900)
 
 
 def _kml_el(parent: ET.Element, tag: str, text: Optional[str] = None) -> ET.Element:
