@@ -13,6 +13,7 @@ Production note:
   then ``BadZipFile: File is not a zip file``. This module downloads only the
   required TIFF members via HTTP Range requests and validates ZIP/TIFF magic.
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,6 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import rasterio.merge
-import requests
 import shapely.geometry
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
@@ -105,9 +105,7 @@ def _head_file(session: Session, url: str) -> Tuple[int, bool]:
     return file_size, "bytes" in accept_ranges.lower()
 
 
-def _download_byte_range(
-    session: Session, url: str, start: int, end: int
-) -> bytes:
+def _download_byte_range(session: Session, url: str, start: int, end: int) -> bytes:
     last_exc: Optional[BaseException] = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -354,7 +352,9 @@ def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, in
                 f"(file size {file_size}). ZIP64 extra field missing or corrupt."
             )
         if compressed_size <= 0:
-            raise ValueError(f"Invalid compressed size for {filename}: {compressed_size}")
+            raise ValueError(
+                f"Invalid compressed size for {filename}: {compressed_size}"
+            )
 
         entries[filename] = {
             "flags": flags,
@@ -520,14 +520,12 @@ def _download_fabdem_for_bounds(
                     ) from exc
 
         tile_paths = [
-            cache_dir / _correct_tile_name(name)
-            for name in intersecting.file_name
+            cache_dir / _correct_tile_name(name) for name in intersecting.file_name
         ]
         missing = [p for p in tile_paths if not p.exists()]
         if missing:
             raise RuntimeError(
-                "FABDEM tile download incomplete: "
-                + ", ".join(p.name for p in missing)
+                "FABDEM tile download incomplete: " + ", ".join(p.name for p in missing)
             )
 
         _merge_rasters(output_path, tile_paths, bounds)
@@ -539,9 +537,7 @@ def _download_fabdem_for_bounds(
         }
 
 
-def _smooth_dtm(
-    src_path: Path, dst_path: Path, aoi_geometry: Any
-) -> Dict[str, Any]:
+def _smooth_dtm(src_path: Path, dst_path: Path, aoi_geometry: Any) -> Dict[str, Any]:
     """Upsample + Gaussian-smooth a clipped DTM, re-clipped to the KML geometry."""
     with rasterio.open(src_path) as src:
         data = src.read(1).astype(np.float32)
@@ -559,7 +555,9 @@ def _smooth_dtm(
             valid &= data != nodata
 
         upscale = DTM_SMOOTH_UPSCALE
-        while upscale > 1 and height * width * upscale * upscale > DTM_SMOOTH_MAX_PIXELS:
+        while (
+            upscale > 1 and height * width * upscale * upscale > DTM_SMOOTH_MAX_PIXELS
+        ):
             upscale -= 1
         out_h, out_w = height * upscale, width * upscale
         out_transform = src.transform * Affine.scale(1.0 / upscale)
@@ -580,11 +578,15 @@ def _smooth_dtm(
 
         up_valid = upsampled != DTM_NODATA
         weights = up_valid.astype(np.float32)
-        numerator = gaussian_filter(np.where(up_valid, upsampled, 0.0), DTM_SMOOTH_SIGMA_PX)
+        numerator = gaussian_filter(
+            np.where(up_valid, upsampled, 0.0), DTM_SMOOTH_SIGMA_PX
+        )
         denominator = gaussian_filter(weights, DTM_SMOOTH_SIGMA_PX)
         with np.errstate(invalid="ignore", divide="ignore"):
             smoothed = np.where(
-                denominator > 1e-6, numerator / np.maximum(denominator, 1e-6), DTM_NODATA
+                denominator > 1e-6,
+                numerator / np.maximum(denominator, 1e-6),
+                DTM_NODATA,
             ).astype(np.float32)
 
         out_inside = geometry_mask(
