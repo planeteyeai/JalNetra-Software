@@ -61,6 +61,7 @@ from jalnetra.fishing_point_service import (
     fishing_point_geometry,
 )
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
+from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.water_quality_service import (
     analyze_water_quality,
     water_quality_geometry,
@@ -242,7 +243,7 @@ async def root() -> Dict[str, Any]:
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
             "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, POST /api/silt, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
-            "POST /api/copernicus-dsm, "
+            "POST /api/fabdem-dtm-raw, POST /api/copernicus-dsm, "
             "POST /api/all (one KML -> every API)"
         ),
         "ngrok_free_tier": (
@@ -1209,6 +1210,58 @@ async def download_fabdem_dtm_tif(tif_id: str) -> Response:
         headers={
             "Content-Disposition": (
                 'attachment; filename="FABDEM_DTM_KML_Clipped.tif"'
+            )
+        },
+    )
+
+
+@app.post("/api/fabdem-dtm-raw")
+async def fabdem_dtm_raw(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → fabdem.download for the KML bbox, clip to exact KML geometry,
+    and return a GeoTIFF download URL. No pixel smoothing: native 30 m cells.
+    """
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        result = await asyncio.to_thread(download_fabdem_dtm_raw_from_kml, kml_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"FABDEM DTM (no smoothing) failed: {exc}"
+        ) from exc
+
+    tif_id = uuid.uuid4().hex
+    _TIF_CACHE[tif_id] = result.pop("tif_bytes")
+    result["tif_id"] = tif_id
+    result["tif_download_url"] = _public_url(
+        request, f"/api/fabdem-dtm-raw/tif/{tif_id}"
+    )
+    return result
+
+
+@app.get("/api/fabdem-dtm-raw/tif/{tif_id}")
+async def download_fabdem_dtm_raw_tif(tif_id: str) -> Response:
+    tif_bytes = _TIF_CACHE.get(tif_id)
+    if tif_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="TIFF not found or expired. Run POST /api/fabdem-dtm-raw again.",
+        )
+    return Response(
+        content=tif_bytes,
+        media_type="image/tiff",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="FABDEM_DTM_KML_Clipped_NoSmoothing.tif"'
             )
         },
     )
