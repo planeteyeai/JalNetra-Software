@@ -14,6 +14,7 @@ Flood logic reuses ../flood_tile (Sentinel-1 SAR).
 BOD/COD logic reuses jalnetra demo pipeline (synthetic demo data).
 Vegetation type/health uses Sentinel-2 + Dynamic World (GEE).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -51,15 +52,12 @@ from jalnetra.bank_erosion_service import (
     analyze_bank_erosion,
     bank_erosion_geometry,
 )
-from jalnetra.kml_buffer import buffered_analysis_geometry
-from jalnetra.lithology_service import analyze_lithology, lithology_geometry
-from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
-from jalnetra.salinity_service import analyze_salinity, salinity_geometry
-from jalnetra.silt_service import analyze_silt, silt_geometry
+from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fishing_point_service import (
     analyze_fishing_points,
     fishing_point_geometry,
 )
+<<<<<<< HEAD
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.water_quality_service import (
@@ -67,12 +65,24 @@ from jalnetra.water_quality_service import (
     water_quality_geometry,
 )
 from jalnetra.water_depth_service import analyze_live_water_depth
+=======
+from jalnetra.kml_buffer import buffered_analysis_geometry
+from jalnetra.kml_pixel_smoother import smooth_kml_bytes
+from jalnetra.lithology_service import analyze_lithology, lithology_geometry
+from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
+from jalnetra.salinity_service import analyze_salinity, salinity_geometry
+from jalnetra.scene_dates import recent_window, select_clear_s2_date
+from jalnetra.silt_service import analyze_silt, silt_geometry
+>>>>>>> dc944c588efa8a4b02d9b5ecc4f603aea46698ba
 from jalnetra.vegetation_service import (
     analyze_vegetation_health,
     analyze_vegetation_type,
 )
-from jalnetra.kml_pixel_smoother import smooth_kml_bytes
-from jalnetra.scene_dates import recent_window, select_clear_s2_date
+from jalnetra.water_depth_service import analyze_live_water_depth
+from jalnetra.water_quality_service import (
+    analyze_water_quality,
+    water_quality_geometry,
+)
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -161,6 +171,7 @@ async def swagger_docs() -> HTMLResponse:
         },
     )
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -170,7 +181,9 @@ app.add_middleware(
 )
 
 
-def _geojson_centroid(geojson: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+def _geojson_centroid(
+    geojson: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[float]]:
     """Return (latitude, longitude) from GeoJSON polygon geometry."""
     if not geojson:
         return None, None
@@ -271,9 +284,7 @@ def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str,
         kml_id = uuid.uuid4().hex
         _KML_CACHE[kml_id] = entry["kml_bytes"]
         row["kml_id"] = kml_id
-        row["kml_download_url"] = _public_url(
-            request, f"/api/flood-water/kml/{kml_id}"
-        )
+        row["kml_download_url"] = _public_url(request, f"/api/flood-water/kml/{kml_id}")
         datewise_out.append(row)
     result["datewise"] = datewise_out
     return result
@@ -467,9 +478,7 @@ def _vegetation_response(
         kml_id = uuid.uuid4().hex
         _KML_CACHE[kml_id] = result.pop("kml_bytes")
     result["kml_id"] = kml_id
-    result["kml_download_url"] = _public_url(
-        request, f"/api/{prefix}/kml/{kml_id}"
-    )
+    result["kml_download_url"] = _public_url(request, f"/api/{prefix}/kml/{kml_id}")
     result["kml_filename"] = filename
     return result
 
@@ -523,9 +532,7 @@ def _water_depth_response(request: Request, result: Dict[str, Any]) -> Dict[str,
     depth_id = _store_smoothed_kml(result.pop("depth_kml_bytes"))
     result["permanent_water"] = {
         "kml_id": water_id,
-        "kml_download_url": _public_url(
-            request, f"/api/water-depth/kml/{water_id}"
-        ),
+        "kml_download_url": _public_url(request, f"/api/water-depth/kml/{water_id}"),
         "kml_filename": result.pop("water_kml_filename", "permanent_water.kml"),
         "color": "#0000FF",
     }
@@ -1149,9 +1156,7 @@ async def download_fishing_point_kml(kml_id: str) -> Response:
     return Response(
         content=kml_bytes,
         media_type="application/vnd.google-earth.kml+xml",
-        headers={
-            "Content-Disposition": 'attachment; filename="fishing_points.kml"'
-        },
+        headers={"Content-Disposition": 'attachment; filename="fishing_points.kml"'},
     )
 
 
@@ -1182,9 +1187,7 @@ async def fabdem_dtm(
     tif_id = uuid.uuid4().hex
     _TIF_CACHE[tif_id] = result.pop("tif_bytes")
     result["tif_id"] = tif_id
-    result["tif_download_url"] = _public_url(
-        request, f"/api/fabdem-dtm/tif/{tif_id}"
-    )
+    result["tif_download_url"] = _public_url(request, f"/api/fabdem-dtm/tif/{tif_id}")
     raw_bytes = result.pop("raw_tif_bytes", None)
     if raw_bytes is not None:
         raw_id = uuid.uuid4().hex
@@ -1208,9 +1211,7 @@ async def download_fabdem_dtm_tif(tif_id: str) -> Response:
         content=tif_bytes,
         media_type="image/tiff",
         headers={
-            "Content-Disposition": (
-                'attachment; filename="FABDEM_DTM_KML_Clipped.tif"'
-            )
+            "Content-Disposition": ('attachment; filename="FABDEM_DTM_KML_Clipped.tif"')
         },
     )
 
@@ -1327,9 +1328,7 @@ async def all_apis(
         "salinity": lambda: salinity(request, upload()),
         "bank_erosion": lambda: bank_erosion(request, upload()),
         "water_quality": lambda: water_quality(request, upload()),
-        "water_depth": lambda: water_depth(
-            request, upload(), depth_min_m, depth_max_m
-        ),
+        "water_depth": lambda: water_depth(request, upload(), depth_min_m, depth_max_m),
         "lithology": lambda: lithology(request, upload()),
         "silt": lambda: silt(request, upload()),
         "fishing_point": lambda: fishing_point(request, upload()),
