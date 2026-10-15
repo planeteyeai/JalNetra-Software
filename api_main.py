@@ -57,15 +57,7 @@ from jalnetra.fishing_point_service import (
     analyze_fishing_points,
     fishing_point_geometry,
 )
-<<<<<<< HEAD
-from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
-from jalnetra.water_quality_service import (
-    analyze_water_quality,
-    water_quality_geometry,
-)
-from jalnetra.water_depth_service import analyze_live_water_depth
-=======
 from jalnetra.kml_buffer import buffered_analysis_geometry
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes
 from jalnetra.lithology_service import analyze_lithology, lithology_geometry
@@ -73,7 +65,11 @@ from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
 from jalnetra.salinity_service import analyze_salinity, salinity_geometry
 from jalnetra.scene_dates import recent_window, select_clear_s2_date
 from jalnetra.silt_service import analyze_silt, silt_geometry
->>>>>>> dc944c588efa8a4b02d9b5ecc4f603aea46698ba
+from jalnetra.water_depth_service import analyze_live_water_depth
+from jalnetra.water_quality_service import (
+    analyze_water_quality,
+    water_quality_geometry,
+)
 from jalnetra.vegetation_service import (
     analyze_vegetation_health,
     analyze_vegetation_type,
