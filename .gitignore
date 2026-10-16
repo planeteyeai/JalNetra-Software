@@ -1,5 +1,113 @@
+# ── Secrets & credentials ─────────────────────────────────────────────────
 .env
-*.key
+.env.*
+!.env.example
 *.pem
-.policy-reports/
-coverage/
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets/
+.secrets/
+serviceAccountKey.json
+google-services.json
+GoogleService-Info.plist
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+ENV/
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+__pypackages__/
+
+# ── Node / React / Angular ────────────────────────────────────────────────
+node_modules/
+.pnp/
+.pnp.js
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── PHP ───────────────────────────────────────────────────────────────────
+vendor/
+# Note: keep composer.lock for apps (reproducible installs), remove for libraries
+# composer.lock
+
+# ── Java / Spring Boot ────────────────────────────────────────────────────
+*.class
+*.jar
+*.war
+*.ear
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+
+# ── Flutter / Dart ────────────────────────────────────────────────────────
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.g.dart
+# Note: keep pubspec.lock for apps, remove for packages
+# pubspec.lock
+
+# ── Build output (all languages) ──────────────────────────────────────────
+dist/
+build/
+out/
+target/
+
+# ── Databases ─────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+dump.rdb
+*.rdb
+mongod.lock
+*.bson
+
+# ── Docker ────────────────────────────────────────────────────────────────
+.dockerignore
+
+# ── Terraform / infra ─────────────────────────────────────────────────────
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/

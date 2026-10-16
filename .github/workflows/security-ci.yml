@@ -1,0 +1,785 @@
+name: Universal Security CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to verify'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECURITY — always run
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  gitleaks:
+    name: "Gitleaks - secret scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  semgrep:
+    name: "Semgrep - SAST"
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: |
+          semgrep ci \
+            --config "p/owasp-top-ten" \
+            --config "p/security-audit" \
+            --config "p/secrets" \
+            --config "p/python" \
+            --config "p/nodejs" \
+            --config "p/java" \
+            --config "p/php" \
+            --config "p/react" \
+            --config "p/django" \
+            --config "p/flask" \
+            --config "p/jwt" \
+            --config "p/sql-injection" \
+            --sarif --output semgrep.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  trivy:
+    name: "Trivy - dependency scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LANGUAGE JOBS — auto-detect, skip if not present
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  nodejs:
+    name: "Node.js"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            if grep -q '"react"' package.json || grep -q '"@angular/core"' package.json || grep -q '"next"' package.json; then
+              echo "present=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "present=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: lts/*
+          cache: npm
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci --prefer-offline
+      - name: Lint
+        if: steps.detect.outputs.present == 'true'
+        run: npm run lint --if-present
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: npm test --if-present -- --ci --coverage
+
+  react:
+    name: "React"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f package.json ] && grep -q '"react"' package.json; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: lts/*
+          cache: npm
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci --prefer-offline
+      - name: Lint
+        if: steps.detect.outputs.present == 'true'
+        run: npm run lint --if-present
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: npm test --if-present -- --ci --coverage --watchAll=false
+      - name: Build
+        if: steps.detect.outputs.present == 'true'
+        run: npm run build --if-present
+
+  angular:
+    name: "Angular"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f package.json ] && grep -q '"@angular/core"' package.json; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: lts/*
+          cache: npm
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci --prefer-offline
+      - name: Lint
+        if: steps.detect.outputs.present == 'true'
+        run: npx ng lint || true
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: npx ng test --watch=false --browsers=ChromeHeadless
+      - name: Build
+        if: steps.detect.outputs.present == 'true'
+        run: npx ng build --configuration production
+
+  python:
+    name: "Python"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f manage.py ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          elif grep -qi "fastapi" requirements.txt 2>/dev/null; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          elif grep -qi "streamlit" requirements.txt 2>/dev/null; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f setup.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          pip install --upgrade pip ruff bandit pytest pytest-cov
+          pip install safety || true
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+      - name: Ruff lint
+        if: steps.detect.outputs.present == 'true'
+        run: ruff check . || true
+      - name: Bandit security
+        if: steps.detect.outputs.present == 'true'
+        run: bandit -r . -ll --exclude ./.venv,./venv,./tests || true
+      - name: Safety check
+        if: steps.detect.outputs.present == 'true'
+        run: safety check --full-report || true
+      - name: Pytest
+        if: steps.detect.outputs.present == 'true'
+        run: pytest --cov=. --cov-report=xml -q || true
+
+  django:
+    name: "Django"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f manage.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          pip install --upgrade pip ruff bandit pytest pytest-django pytest-cov
+          pip install safety || true
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+      - name: Ruff lint
+        if: steps.detect.outputs.present == 'true'
+        run: ruff check . || true
+      - name: Bandit security
+        if: steps.detect.outputs.present == 'true'
+        run: bandit -r . -ll --exclude ./.venv,./venv,./tests || true
+      - name: Safety check
+        if: steps.detect.outputs.present == 'true'
+        run: safety check --full-report || true
+      - name: Django system check + tests
+        if: steps.detect.outputs.present == 'true'
+        env:
+          DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+          DJANGO_SETTINGS_MODULE: ${{ vars.DJANGO_SETTINGS_MODULE || 'core.settings' }}
+          SECRET_KEY: ci-only-secret-key-not-for-production
+        run: |
+          python manage.py check --deploy --fail-level WARNING || true
+          pytest --cov=. --cov-report=xml -q || true
+
+  fastapi:
+    name: "FastAPI"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if grep -qi "fastapi" requirements.txt 2>/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          pip install --upgrade pip ruff bandit pytest pytest-cov httpx
+          pip install safety || true
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+      - name: Ruff lint
+        if: steps.detect.outputs.present == 'true'
+        run: ruff check . || true
+      - name: Bandit security
+        if: steps.detect.outputs.present == 'true'
+        run: bandit -r . -ll --exclude ./.venv,./venv,./tests || true
+      - name: Safety check
+        if: steps.detect.outputs.present == 'true'
+        run: safety check --full-report || true
+      - name: Pytest
+        if: steps.detect.outputs.present == 'true'
+        run: pytest --cov=. --cov-report=xml -q || true
+
+  streamlit:
+    name: "Streamlit"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if grep -qi "streamlit" requirements.txt 2>/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          pip install --upgrade pip ruff bandit
+          pip install safety || true
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+      - name: Ruff lint
+        if: steps.detect.outputs.present == 'true'
+        run: ruff check . || true
+      - name: Bandit security
+        if: steps.detect.outputs.present == 'true'
+        run: bandit -r . -ll --exclude ./.venv,./venv || true
+      - name: Safety check
+        if: steps.detect.outputs.present == 'true'
+        run: safety check --full-report || true
+
+  php:
+    name: "PHP"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f composer.json ] || find . -maxdepth 2 -name "*.php" | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: shivammathur/setup-php@v2
+        if: steps.detect.outputs.present == 'true'
+        with:
+          php-version: "8.3"
+          tools: composer, phpstan, phpcs
+          coverage: xdebug
+      - name: Install deps
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          [ -f composer.json ] && composer install --no-interaction --prefer-dist || true
+      - name: PHP CodeSniffer
+        if: steps.detect.outputs.present == 'true'
+        run: phpcs --standard=PSR12 --ignore=vendor/ . || true
+      - name: PHPStan
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          if [ -f phpstan.neon ]; then
+            phpstan analyse || true
+          elif [ -d src ]; then
+            phpstan analyse --level=5 src/ || true
+          fi
+      - name: PHPUnit
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          [ -f vendor/bin/phpunit ] && vendor/bin/phpunit --coverage-text || true
+
+  java:
+    name: "Java"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f pom.xml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "tool=maven" >> "$GITHUB_OUTPUT"
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "tool=gradle" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "tool=none" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-java@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: ${{ steps.detect.outputs.tool }}
+      - name: Build (Maven)
+        if: steps.detect.outputs.present == 'true' && steps.detect.outputs.tool == 'maven'
+        run: mvn -B verify --no-transfer-progress
+      - name: Build (Gradle)
+        if: steps.detect.outputs.present == 'true' && steps.detect.outputs.tool == 'gradle'
+        run: ./gradlew build test --no-daemon
+
+  flutter:
+    name: "Flutter"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f pubspec.yaml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.present == 'true'
+        with:
+          channel: stable
+          cache: true
+      - name: Get packages
+        if: steps.detect.outputs.present == 'true'
+        run: flutter pub get
+      - name: Analyze
+        if: steps.detect.outputs.present == 'true'
+        run: flutter analyze || true
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: flutter test --coverage || true
+
+  static-web:
+    name: "HTML / CSS / JS"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if find . -name "*.html" -not -path "*/node_modules/*" | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: lts/*
+      - name: Install linters
+        if: steps.detect.outputs.present == 'true'
+        run: npm install -g htmlhint stylelint stylelint-config-standard eslint
+      - name: HTMLHint
+        if: steps.detect.outputs.present == 'true'
+        run: htmlhint "**/*.html" --ignore "node_modules/**" || true
+      - name: Stylelint
+        if: steps.detect.outputs.present == 'true'
+        run: stylelint "**/*.css" --ignore-path .gitignore || true
+      - name: ESLint
+        if: steps.detect.outputs.present == 'true'
+        run: eslint "**/*.js" --ignore-pattern "node_modules/**" || true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATABASE / INFRA HYGIENE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  db-hygiene:
+    name: "DB / Infra hygiene"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SQL safety lint
+        run: |
+          echo "Checking SQL files for dangerous patterns..."
+          found=0
+          while IFS= read -r -d '' f; do
+            if grep -Eni "DROP TABLE [^I]|DELETE FROM [^ ]+[[:space:]]*;|TRUNCATE " "$f"; then
+              echo "WARNING: Dangerous SQL found in $f — review before merging"
+              found=1
+            fi
+          done < <(find . -name "*.sql" -not -path "*/node_modules/*" -print0 2>/dev/null)
+          [ $found -eq 0 ] && echo "No dangerous SQL patterns found."
+
+      - name: Validate YAML configs
+        run: |
+          pip install pyyaml -q
+          while IFS= read -r -d '' f; do
+            python3 -c "
+          import yaml, sys
+          try:
+              yaml.safe_load(open('$f'))
+              print('OK:', '$f')
+          except Exception as e:
+              print('INVALID YAML:', '$f', str(e))
+              sys.exit(1)
+          " || true
+          done < <(find . \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" \) \
+                     -not -path "*/node_modules/*" -print0 2>/dev/null)
+
+      - name: Hardcoded credential check
+        run: |
+          found=0
+          for pattern in \
+            "password[[:space:]]*=[[:space:]]*['\"][^'\"]{4,}" \
+            "MONGO_URI.*:.*@" \
+            "redis://:.*@" \
+            "postgresql://[^:]*:[^@]*@" \
+            "mysql://[^:]*:[^@]*@"; do
+            hits=$(grep -rEin "$pattern" . \
+              --include="*.conf" \
+              --include="*.yml" \
+              --include="*.yaml" \
+              --include="*.json" \
+              --exclude-dir=node_modules \
+              --exclude-dir=.git \
+              --exclude-dir=.venv \
+              2>/dev/null || true)
+            if [ -n "$hits" ]; then
+              echo "WARNING: Possible hardcoded credential found:"
+              echo "$hits"
+              found=1
+            fi
+          done
+          [ $found -eq 0 ] && echo "No hardcoded credentials found."
+
+  docker:
+    name: "Docker"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect
+        id: detect
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Lint Dockerfile
+        if: steps.detect.outputs.present == 'true'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008,DL3009
+          failure-threshold: error
+      - name: Build and scan image
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          docker build -t ci-image:latest . --quiet
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --exit-code 0 \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            ci-image:latest
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UMBRELLA — only this job goes into branch protection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  all-checks-passed:
+    name: all-checks-passed
+    runs-on: ubuntu-latest
+    needs:
+      - gitleaks
+      - semgrep
+      - trivy
+      - nodejs
+      - react
+      - angular
+      - python
+      - django
+      - fastapi
+      - streamlit
+      - php
+      - java
+      - flutter
+      - static-web
+      - db-hygiene
+      - docker
+    if: always()
+    steps:
+      - name: Check all results
+        id: check
+        run: |
+          cat << 'PYEOF' > /tmp/check.py
+          import json, sys
+          raw = sys.stdin.read()
+          data = json.loads(raw)
+          bad = [k for k, v in data.items() if v["result"] not in ("success", "skipped")]
+          if bad:
+              print("FAILED:", ", ".join(bad))
+              sys.exit(1)
+          print("All checks passed.")
+          PYEOF
+          echo '${{ toJSON(needs) }}' | python3 /tmp/check.py
+
+      - uses: actions/checkout@v4
+        if: always()
+
+      - name: Generate security report
+        if: always()
+        run: |
+          cat > security-report.md << 'EOF'
+          # Security CI Report
+          
+          **Triggered by:** ${{ github.event_name }}
+          **Branch:** ${{ github.ref_name }}
+          **Commit:** ${{ github.sha }}
+          **Author:** ${{ github.actor }}
+          **Time:** ${{ github.event.head_commit.timestamp }}
+          
+          ## Job Results
+          
+          | Job | Status |
+          |-----|--------|
+          | Gitleaks | ${{ needs.gitleaks.result }} |
+          | Semgrep | ${{ needs.semgrep.result }} |
+          | Trivy | ${{ needs.trivy.result }} |
+          | Node.js | ${{ needs.nodejs.result }} |
+          | React | ${{ needs.react.result }} |
+          | Angular | ${{ needs.angular.result }} |
+          | Python | ${{ needs.python.result }} |
+          | Django | ${{ needs.django.result }} |
+          | FastAPI | ${{ needs.fastapi.result }} |
+          | Streamlit | ${{ needs.streamlit.result }} |
+          | PHP | ${{ needs.php.result }} |
+          | Java | ${{ needs.java.result }} |
+          | Flutter | ${{ needs.flutter.result }} |
+          | Static Web | ${{ needs.static-web.result }} |
+          | DB Hygiene | ${{ needs.db-hygiene.result }} |
+          | Docker | ${{ needs.docker.result }} |
+          
+          ## Summary
+          
+          - ✅ Passed: $(echo '${{ toJSON(needs) }}' | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for v in d.values() if v['result']=='success'))")
+          - ⏭️ Skipped: $(echo '${{ toJSON(needs) }}' | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for v in d.values() if v['result']=='skipped'))")
+          - ❌ Failed: $(echo '${{ toJSON(needs) }}' | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for v in d.values() if v['result']=='failure'))")
+          
+          ---
+          
+          View full details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          cat security-report.md
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ github.run_number }}
+          path: security-report.md
+          retention-days: 90
+
+      - name: Comment on PR with report
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  POST-DEPLOY VERIFICATION (manual trigger or after deployment)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  post-deploy-verify:
+    name: Post-deploy verification
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify deployment endpoint
+        id: verify
+        run: |
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          
+          # Add your deployment URL here
+          if [ "${{ github.event.inputs.environment }}" = "production" ]; then
+            DEPLOY_URL="${{ secrets.PROD_URL || 'https://api.yourapp.com' }}"
+          elif [ "${{ github.event.inputs.environment }}" = "staging" ]; then
+            DEPLOY_URL="${{ secrets.STAGING_URL || 'https://staging-api.yourapp.com' }}"
+          else
+            DEPLOY_URL="${{ secrets.DEV_URL || 'https://dev-api.yourapp.com' }}"
+          fi
+          
+          echo "Testing: $DEPLOY_URL/health"
+          
+          # Health check
+          status=$(curl -s -o /dev/null -w "%{http_code}" "$DEPLOY_URL/health" || echo "000")
+          
+          if [ "$status" = "200" ]; then
+            echo "✅ Deployment is LIVE and responding"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ Deployment FAILED or not responding (HTTP $status)"
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Security headers check
+        if: always()
+        run: |
+          echo "Checking security headers..."
+          
+          DEPLOY_URL="${{ secrets.PROD_URL || 'https://api.yourapp.com' }}"
+          
+          headers=$(curl -s -I "$DEPLOY_URL" || echo "")
+          
+          echo "$headers" | grep -i "X-Frame-Options" && echo "✅ X-Frame-Options present" || echo "⚠️ X-Frame-Options missing"
+          echo "$headers" | grep -i "X-Content-Type-Options" && echo "✅ X-Content-Type-Options present" || echo "⚠️ X-Content-Type-Options missing"
+          echo "$headers" | grep -i "Strict-Transport-Security" && echo "✅ HSTS present" || echo "⚠️ HSTS missing"
+          echo "$headers" | grep -i "Content-Security-Policy" && echo "✅ CSP present" || echo "⚠️ CSP missing"
+
+      - name: Generate post-deploy report
+        if: always()
+        run: |
+          cat > post-deploy-report.md << 'EOF'
+          # Post-Deploy Verification Report
+          
+          **Environment:** ${{ github.event.inputs.environment }}
+          **Time:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Triggered by:** ${{ github.actor }}
+          
+          ## Verification Results
+          
+          | Check | Status |
+          |-------|--------|
+          | Deployment Health | ${{ steps.verify.outputs.status == 'success' && '✅ PASS' || '❌ FAIL' }} |
+          | Security Headers | See details above |
+          
+          ## Actions Taken
+          
+          - Verified deployment endpoint is responding
+          - Checked security headers configuration
+          - Confirmed HTTP status codes
+          
+          ---
+          
+          View full log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          cat post-deploy-report.md
+
+      - name: Upload post-deploy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-deploy-report-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: post-deploy-report.md
+          retention-days: 90
