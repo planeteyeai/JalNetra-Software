@@ -31,7 +31,7 @@ echo for %%%%f in ^(security-scan-report-*.txt^) do del "%%%%f" 2^>nul
 echo if not exist .pre-commit-config.yaml exit /b 0
 echo set REPORT_FILE=security-scan-report-%%date:~-4,4%%%%date:~-10,2%%%%date:~-7,2%%-%%time:~0,2%%%%time:~3,2%%.txt
 echo set REPORT_FILE=%%REPORT_FILE: =0%%
-echo ^( echo ========================================== ^& echo Security Scan Report ^& echo Generated: %%date%% %%time%% ^& echo ========================================== ^& echo. ^& pre-commit run --all-files 2^>^&1 ^& echo. ^& echo ========================================== ^& echo Scan completed: %%date%% %%time%% ^& echo Report: %%REPORT_FILE%% ^& echo ========================================== ^) ^> "%%REPORT_FILE%%" 2^>^&1
+echo ^( echo ========================================== ^& echo Security Scan Report ^& echo Generated: %%date%% %%time%% ^& echo ========================================== ^& echo. ^& pre-commit run 2^>^&1 ^& echo. ^& echo ========================================== ^& echo Scan completed: %%date%% %%time%% ^& echo Report: %%REPORT_FILE%% ^& echo ========================================== ^) ^> "%%REPORT_FILE%%" 2^>^&1
 echo type "%%REPORT_FILE%%"
 echo exit /b %%ERRORLEVEL%%
 ) > "%GLOBAL_HOOKS%\pre-commit.bat"
