@@ -16,6 +16,7 @@ GoogleService-Info.plist
 
 # ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
+.kml_cache/
 *.py[cod]
 *.pyo
 .venv/

@@ -52,12 +52,12 @@ from jalnetra.bank_erosion_service import (
     analyze_bank_erosion,
     bank_erosion_geometry,
 )
+from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fishing_point_service import (
     analyze_fishing_points,
     fishing_point_geometry,
 )
-from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.kml_buffer import buffered_analysis_geometry
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes
 from jalnetra.lithology_service import analyze_lithology, lithology_geometry
@@ -65,11 +65,6 @@ from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
 from jalnetra.salinity_service import analyze_salinity, salinity_geometry
 from jalnetra.scene_dates import recent_window, select_clear_s2_date
 from jalnetra.silt_service import analyze_silt, silt_geometry
-from jalnetra.water_depth_service import analyze_live_water_depth
-from jalnetra.water_quality_service import (
-    analyze_water_quality,
-    water_quality_geometry,
-)
 from jalnetra.vegetation_service import (
     analyze_vegetation_health,
     analyze_vegetation_type,
@@ -84,6 +79,10 @@ _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
 _KML_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
 _TIF_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
+# Disk-backed KML store — survives uvicorn --reload (in-memory cache alone does not).
+_KML_DISK_DIR = HERE / ".kml_cache"
+_KML_DISK_DIR.mkdir(exist_ok=True)
+_KML_DISK_TTL_S = 3600
 
 RIVER_DASHBOARD_DIRS = {
     "mithi": HERE / "dashboard" / "mithi",
@@ -250,7 +249,8 @@ async def root() -> Dict[str, Any]:
             "POST /api/flood-water, POST /api/bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
-            "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, POST /api/silt, "
+            "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, "
+            "POST /api/silt-classification, POST /api/silt-volume, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
             "POST /api/fabdem-dtm-raw, POST /api/copernicus-dsm, "
             "POST /api/all (one KML -> every API)"
@@ -278,7 +278,7 @@ def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str,
     for entry in result.get("datewise") or []:
         row = {k: v for k, v in entry.items() if k != "kml_bytes"}
         kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = entry["kml_bytes"]
+        _put_cached_kml(kml_id, entry["kml_bytes"])
         row["kml_id"] = kml_id
         row["kml_download_url"] = _public_url(request, f"/api/flood-water/kml/{kml_id}")
         datewise_out.append(row)
@@ -350,7 +350,7 @@ async def flood_water(
 
 @app.get("/api/flood-water/kml/{kml_id}")
 async def download_flood_water_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -450,13 +450,50 @@ def _kml_geometry_from_bytes(kml_bytes: bytes):
     return kml_bytes_to_ee_geometry(kml_bytes)
 
 
+def _kml_disk_path(kml_id: str) -> Path:
+    # Reject path traversal — ids are always hex from uuid4.
+    safe = "".join(c for c in kml_id if c.isalnum())
+    return _KML_DISK_DIR / f"{safe}.kml"
+
+
+def _put_cached_kml(kml_id: str, kml_bytes: bytes) -> None:
+    _KML_CACHE[kml_id] = kml_bytes
+    try:
+        _kml_disk_path(kml_id).write_bytes(kml_bytes)
+    except OSError:
+        pass
+
+
+def _get_cached_kml(kml_id: str) -> Optional[bytes]:
+    cached = _KML_CACHE.get(kml_id)
+    if cached is not None:
+        return cached
+    path = _kml_disk_path(kml_id)
+    try:
+        if not path.is_file():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > _KML_DISK_TTL_S:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        data = path.read_bytes()
+        _KML_CACHE[kml_id] = data
+        return data
+    except OSError:
+        return None
+
+
 def _store_smoothed_kml(kml_bytes: bytes) -> str:
     """Pixel-smooth GroundOverlay PNGs (kml_pixel_smoother) and cache the KML."""
     kml_id = uuid.uuid4().hex
     try:
-        _KML_CACHE[kml_id] = smooth_kml_bytes(kml_bytes)
+        payload = smooth_kml_bytes(kml_bytes)
     except Exception:
-        _KML_CACHE[kml_id] = kml_bytes
+        payload = kml_bytes
+    _put_cached_kml(kml_id, payload)
     return kml_id
 
 
@@ -472,7 +509,7 @@ def _vegetation_response(
         kml_id = _store_smoothed_kml(result.pop("kml_bytes"))
     else:
         kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop("kml_bytes")
+        _put_cached_kml(kml_id, result.pop("kml_bytes"))
     result["kml_id"] = kml_id
     result["kml_download_url"] = _public_url(request, f"/api/{prefix}/kml/{kml_id}")
     result["kml_filename"] = filename
@@ -497,28 +534,51 @@ def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[st
     return result
 
 
-def _silt_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach classification + volume KML download URLs for each month with imagery."""
+def _store_raw_kml(kml_bytes: bytes) -> str:
+    """Cache KML as-is (silt already EE-smoothed; pixel smoother was too slow)."""
+    kml_id = uuid.uuid4().hex
+    _put_cached_kml(kml_id, kml_bytes)
+    return kml_id
+
+
+def _silt_classification_response(
+    request: Request, result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Attach classification KML download URLs only (no volume KMLs)."""
     for key in list(result.get("months") or {}):
+        result.pop(f"{key}_volume_kml_bytes", None)
+        result["months"][key].pop("silt_volume", None)
         bytes_key = f"{key}_kml_bytes"
         if bytes_key not in result:
             continue
         filename = result["months"][key].get("kml_filename", f"silt_{key}.kml")
-        kml_id = _store_smoothed_kml(result.pop(bytes_key))
+        kml_id = _store_raw_kml(result.pop(bytes_key))
         result["months"][key]["kml_id"] = kml_id
         result["months"][key]["kml_download_url"] = _public_url(
             request, f"/api/silt/kml/{kml_id}"
         )
         result["months"][key]["kml_filename"] = filename
+    for row in result.get("combined_summary") or []:
+        row.pop("total_silt_volume_m3", None)
+    return result
 
+
+def _silt_volume_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach volume KML download URLs only (no classification KMLs)."""
+    for key in list(result.get("months") or {}):
+        result.pop(f"{key}_kml_bytes", None)
+        month = result["months"][key]
+        for drop in ("categories", "legend", "kml_filename", "export_scale_m"):
+            month.pop(drop, None)
         volume_key = f"{key}_volume_kml_bytes"
-        volume = result["months"][key].get("silt_volume")
+        volume = month.get("silt_volume")
         if volume_key in result and volume is not None:
-            volume_id = _store_smoothed_kml(result.pop(volume_key))
+            volume_id = _store_raw_kml(result.pop(volume_key))
             volume["kml_id"] = volume_id
             volume["kml_download_url"] = _public_url(
                 request, f"/api/silt/kml/{volume_id}"
             )
+    result.pop("legend", None)
     return result
 
 
@@ -614,7 +674,7 @@ async def vegetation_type(
 
 @app.get("/api/vegetation-type/kml/{kml_id}")
 async def download_vegetation_type_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -677,7 +737,7 @@ async def vegetation_health(
 
 @app.get("/api/vegetation-health/kml/{kml_id}")
 async def download_vegetation_health_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -729,7 +789,7 @@ async def lulc(
 
 @app.get("/api/lulc/kml/{kml_id}")
 async def download_lulc_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -791,7 +851,7 @@ async def salinity(
 
 @app.get("/api/salinity/kml/{kml_id}")
 async def download_salinity_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -846,7 +906,7 @@ async def bank_erosion(
 
 @app.get("/api/bank-erosion/kml/{kml_id}")
 async def download_bank_erosion_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -908,7 +968,7 @@ async def water_quality(
 
 @app.get("/api/water-quality/kml/{kml_id}")
 async def download_water_quality_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -971,7 +1031,7 @@ async def water_depth(
 
 @app.get("/api/water-depth/kml/{kml_id}")
 async def download_water_depth_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -1032,7 +1092,7 @@ async def lithology(
 
 @app.get("/api/lithology/kml/{kml_id}")
 async def download_lithology_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -1045,18 +1105,13 @@ async def download_lithology_kml(kml_id: str) -> Response:
     )
 
 
-@app.post("/api/silt")
-async def silt(
-    request: Request,
-    kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
+async def _run_silt_analysis(
+    kml: UploadFile,
+    *,
+    include_classification: bool,
+    include_volume: bool,
 ) -> Dict[str, Any]:
-    """
-    Upload KML → monthly silt classification from January 2026 through today.
-
-    No buffer. Months without Sentinel-2 imagery are skipped. Returns one
-    smoothed KML per available month plus class areas as % of water area.
-    Dynamic World is not used.
-    """
+    """Run silt analysis for one product only (skips the other PNG/KML path)."""
     _require_earth_engine()
 
     kml_bytes = await kml.read()
@@ -1065,10 +1120,12 @@ async def silt(
 
     try:
         aoi_geom, aoi_info = await asyncio.to_thread(silt_geometry, kml_bytes)
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
             analyze_silt,
             aoi_geom,
             aoi_info=aoi_info,
+            include_classification=include_classification,
+            include_volume=include_volume,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1077,16 +1134,60 @@ async def silt(
             status_code=500, detail=f"Silt analysis failed: {exc}"
         ) from exc
 
-    return await asyncio.to_thread(_silt_response, request, result)
+
+@app.post("/api/silt-classification")
+async def silt_classification(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → monthly silt classification KMLs from January 2026 through today.
+
+    Classification KMLs only (no silt volume overlays). Months without
+    Sentinel-2 imagery are skipped. Dynamic World is not used.
+    """
+    result = await _run_silt_analysis(
+        kml, include_classification=True, include_volume=False
+    )
+    return await asyncio.to_thread(_silt_classification_response, request, result)
+
+
+@app.post("/api/silt-volume")
+async def silt_volume(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → monthly silt volume KMLs from January 2026 through today.
+
+    Volume KMLs only (no silt classification overlays). Months without
+    Sentinel-2 imagery are skipped. Dynamic World is not used.
+    """
+    result = await _run_silt_analysis(
+        kml, include_classification=False, include_volume=True
+    )
+    return await asyncio.to_thread(_silt_volume_response, request, result)
+
+
+@app.post("/api/silt")
+async def silt(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
+) -> Dict[str, Any]:
+    """Alias of POST /api/silt-classification (classification KMLs only)."""
+    return await silt_classification(request, kml)
 
 
 @app.get("/api/silt/kml/{kml_id}")
 async def download_silt_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
-            detail="KML not found or expired. Run POST /api/silt again.",
+            detail=(
+                "KML not found or expired. Run POST /api/silt-classification "
+                "or POST /api/silt-volume again."
+            ),
         )
     return Response(
         content=kml_bytes,
@@ -1132,7 +1233,7 @@ async def fishing_point(
         ) from exc
 
     kml_id = uuid.uuid4().hex
-    _KML_CACHE[kml_id] = result.pop("kml_bytes")
+    _put_cached_kml(kml_id, result.pop("kml_bytes"))
     result["kml_id"] = kml_id
     result["kml_download_url"] = _public_url(
         request, f"/api/fishing-point/kml/{kml_id}"
@@ -1143,7 +1244,7 @@ async def fishing_point(
 
 @app.get("/api/fishing-point/kml/{kml_id}")
 async def download_fishing_point_kml(kml_id: str) -> Response:
-    kml_bytes = _KML_CACHE.get(kml_id)
+    kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
@@ -1276,7 +1377,8 @@ ALL_API_NAMES = (
     "water_quality",
     "water_depth",
     "lithology",
-    "silt",
+    "silt_classification",
+    "silt_volume",
     "fishing_point",
     "fabdem_dtm",
 )
@@ -1295,7 +1397,7 @@ async def all_apis(
     apis: Optional[str] = Form(
         None,
         description=(
-            "Optional comma-separated subset, e.g. 'salinity,silt'. "
+            "Optional comma-separated subset, e.g. 'salinity,silt_volume'. "
             f"Default: all ({', '.join(ALL_API_NAMES)})"
         ),
     ),
@@ -1326,7 +1428,8 @@ async def all_apis(
         "water_quality": lambda: water_quality(request, upload()),
         "water_depth": lambda: water_depth(request, upload(), depth_min_m, depth_max_m),
         "lithology": lambda: lithology(request, upload()),
-        "silt": lambda: silt(request, upload()),
+        "silt_classification": lambda: silt_classification(request, upload()),
+        "silt_volume": lambda: silt_volume(request, upload()),
         "fishing_point": lambda: fishing_point(request, upload()),
         "fabdem_dtm": lambda: fabdem_dtm(request, upload()),
     }
