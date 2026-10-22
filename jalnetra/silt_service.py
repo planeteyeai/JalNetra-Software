@@ -37,7 +37,10 @@ MAX_THUMB_DIMENSION = 2048
 MAX_PIXELS = 1e13
 TILE_SCALE = 4
 KML_OVERLAY_COLOR = "ffffffff"
-MAX_CLOUD_S2 = 40
+MAX_CLOUD_S2 = 20
+# May–August (monsoon) use a looser cloud limit so months are not all skipped.
+MAX_CLOUD_S2_MAY_AUG = 40
+MAY_AUG_MONTHS = frozenset({5, 6, 7, 8})
 MONTH_WORKERS = 4
 
 # Silt volume surface = silt score × pixel area (10 m grid, EPSG:4326) × layer
@@ -455,11 +458,14 @@ def _process_month(
             )
         )
 
+    cloud_limit = (
+        MAX_CLOUD_S2_MAY_AUG if month_number in MAY_AUG_MONTHS else MAX_CLOUD_S2
+    )
     raw_s2 = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(aoi)
         .filterDate(start_date, end_date)
-        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_S2))
+        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", cloud_limit))
     )
     s2_count = int(raw_s2.size().getInfo() or 0)
     if s2_count == 0:
