@@ -552,7 +552,7 @@ def _silt_classification_response(
         if bytes_key not in result:
             continue
         filename = result["months"][key].get("kml_filename", f"silt_{key}.kml")
-        kml_id = _store_raw_kml(result.pop(bytes_key))
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result["months"][key]["kml_id"] = kml_id
         result["months"][key]["kml_download_url"] = _public_url(
             request, f"/api/silt/kml/{kml_id}"
@@ -573,7 +573,7 @@ def _silt_volume_response(request: Request, result: Dict[str, Any]) -> Dict[str,
         volume_key = f"{key}_volume_kml_bytes"
         volume = month.get("silt_volume")
         if volume_key in result and volume is not None:
-            volume_id = _store_raw_kml(result.pop(volume_key))
+            volume_id = _store_smoothed_kml(result.pop(volume_key))
             volume["kml_id"] = volume_id
             volume["kml_download_url"] = _public_url(
                 request, f"/api/silt/kml/{volume_id}"
