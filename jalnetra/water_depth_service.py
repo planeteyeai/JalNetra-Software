@@ -3,7 +3,7 @@ JalNetra live water-depth analysis.
 
 Input: an EE geometry derived from a KML polygon.
 Output: two KMLs —
-  - permanent / SAR water extent in blue
+  - live water extent (Sentinel-2 MNDWI frequency) in blue
   - Sentinel-2 relative depth in green -> yellow -> orange -> red
 
 Depth is a relative optical band-ratio estimate, not survey-grade bathymetry.
@@ -22,14 +22,17 @@ import ee
 from jalnetra.ee_http import read_url
 from jalnetra.scene_dates import (
     S2_MAX_CLOUD_PCT,
+    recent_window,
     select_clear_s2_date,
-    select_recent_s1_date,
 )
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 MAX_EXPORT_PIXELS = 8_000_000
 WATER_BLUE = "0000FF"
 DEPTH_PALETTE = ["00A651", "FFFF00", "FFA500", "FF0000"]
+# Live water = share of clear S2 scenes with MNDWI above threshold (river_depth_gee).
+MNDWI_WATER_THRESHOLD = 0.0
+LIVE_WATER_FREQ_THRESHOLD = 0.5
 
 
 def _aoi_box(geometry: ee.Geometry) -> Dict[str, float]:
@@ -132,34 +135,48 @@ def analyze_live_water_depth(
     depth_max_m: Optional[float] = None,
 ) -> Dict[str, Any]:
     today = date.today()
-    s1_selection = select_recent_s1_date(geometry, today=today, polarisation="VV")
     s2_selection = select_clear_s2_date(geometry, today=today)
+    window_start, window_end = recent_window(today)
 
-    s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
-          .filterBounds(geometry)
-          .filterDate(s1_selection["start_date"], s1_selection["end_date"])
-          .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-          .filter(ee.Filter.eq("instrumentMode", "IW"))
-          .select("VV"))
-    if int(s1.size().getInfo() or 0) == 0:
+    # Live water: Sentinel-2 MNDWI frequency over the look-back window
+    # (same logic as river_depth_gee water mask / freq_thr).
+    s2_window = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(geometry)
+        .filterDate(window_start, window_end)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", S2_MAX_CLOUD_PCT))
+    )
+    if int(s2_window.size().getInfo() or 0) == 0:
         raise ValueError(
-            f"No Sentinel-1 VV image found on {s1_selection['selected_date']}."
+            f"No Sentinel-2 scenes found between {window_start} and {window_end}."
         )
 
-    s1_image_dates = _ee_ymd_list(s1)
-    s1_image_date = _ee_ymd(ee.Image(s1.sort("system:time_start", False).first()))
+    def _clear_pixel(img: ee.Image) -> ee.Image:
+        s = img.select("SCL")
+        return (
+            s.eq(1).Or(s.eq(3)).Or(s.eq(8)).Or(s.eq(9)).Or(s.eq(10)).Or(s.eq(11))
+        ).Not()
 
-    # Latest available S1 mosaic, followed by focal median smoothing as in the supplied workflow.
-    water_db = s1.sort("system:time_start", False).mosaic().clip(geometry)
-    water = (water_db.focal_median(30, "circle", "meters")
-             .lt(-17).rename("water_mask").selfMask().clip(geometry))
+    def _water_img(img: ee.Image) -> ee.Image:
+        w = img.normalizedDifference(["B3", "B11"]).gt(MNDWI_WATER_THRESHOLD).rename("w")
+        return w.updateMask(_clear_pixel(img))
 
-    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-          .filterBounds(geometry)
-          .filterDate(s2_selection["start_date"], s2_selection["end_date"])
-          .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", S2_MAX_CLOUD_PCT))
-          .select(["B2", "B3", "SCL"])
-          .sort("CLOUDY_PIXEL_PERCENTAGE"))
+    freq = s2_window.map(_water_img).mean()
+    water = (
+        freq.gte(LIVE_WATER_FREQ_THRESHOLD)
+        .clip(geometry)
+        .selfMask()
+        .rename("water_mask")
+    )
+
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(geometry)
+        .filterDate(s2_selection["start_date"], s2_selection["end_date"])
+        .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", S2_MAX_CLOUD_PCT))
+        .select(["B2", "B3", "SCL"])
+        .sort("CLOUDY_PIXEL_PERCENTAGE")
+    )
     if int(s2.size().getInfo() or 0) == 0:
         raise ValueError(
             f"No Sentinel-2 image found on {s2_selection['selected_date']}."
@@ -167,6 +184,7 @@ def analyze_live_water_depth(
 
     s2_best_raw = ee.Image(s2.first())
     s2_image_date = _ee_ymd(s2_best_raw)
+    s2_image_dates = _ee_ymd_list(s2_window)
     s2_best = s2_best_raw.clip(geometry)
     scl = s2_best.select("SCL")
     cloud_mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
@@ -194,7 +212,7 @@ def analyze_live_water_depth(
     depth = (ratio_water.unitScale(p_low, p_high).clamp(0, 1)
              .multiply(depth_max - depth_min).add(depth_min).rename("depth_m").clip(geometry))
 
-    # Fill optical gaps inside SAR water extent, then smooth the depth surface.
+    # Fill optical gaps inside live-water extent, then smooth the depth surface.
     fill1 = depth.reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.circle(radius=50, units="meters"), None, True)
     depth1 = depth.unmask(fill1)
     fill2 = depth1.reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.circle(radius=150, units="meters"), None, True)
@@ -224,11 +242,12 @@ def analyze_live_water_depth(
     ).getInfo().get("area")
 
     water_kml = _build_kml(
-        f"Permanent Water - {s1_image_date or today.isoformat()}",
-        f"Sentinel-1 SAR water extent (blue). Image date: {s1_image_date or 'unknown'}. "
-        f"Water area: {water_area_ha} ha.",
+        f"Live Water - {s2_image_date or today.isoformat()}",
+        f"Sentinel-2 MNDWI live water (blue). Frequency threshold: "
+        f"{LIVE_WATER_FREQ_THRESHOLD}. Window: {s2_selection['window_start']} to "
+        f"{s2_selection['window_end']}. Water area: {water_area_ha} ha.",
         box,
-        "Permanent Water - Blue",
+        "Live Water - Blue",
         water_png,
     )
     depth_kml = _build_kml(
@@ -244,17 +263,18 @@ def analyze_live_water_depth(
     return {
         "analysis_date": today.isoformat(),
         "image_date": s2_image_date,
-        "sentinel1_image_date": s1_image_date,
-        "sentinel1_image_dates": s1_image_dates,
         "sentinel2_image_date": s2_image_date,
-        "sentinel1_window": {
-            "start": s1_selection["window_start"], "end": s1_selection["window_end"]
-        },
+        "sentinel2_image_dates": s2_image_dates,
         "sentinel2_window": {
             "start": s2_selection["window_start"], "end": s2_selection["window_end"]
         },
-        "sentinel1_selection": s1_selection,
         "sentinel2_selection": s2_selection,
+        "live_water": {
+            "mndwi_threshold": MNDWI_WATER_THRESHOLD,
+            "frequency_threshold": LIVE_WATER_FREQ_THRESHOLD,
+            "window_start": s2_selection["window_start"],
+            "window_end": s2_selection["window_end"],
+        },
         "input_depth_range_m": {"min": depth_min, "max": depth_max},
         "water_area_ha": water_area_ha,
         "depth": {"min_m": stats.get("depth_m_min"), "max_m": stats.get("depth_m_max"), "mean_m": stats.get("depth_m_mean")},
@@ -267,6 +287,6 @@ def analyze_live_water_depth(
         },
         "water_kml_bytes": water_kml,
         "depth_kml_bytes": depth_kml,
-        "water_kml_filename": f"permanent_water_{s1_image_date or today.isoformat()}.kml",
+        "water_kml_filename": f"live_water_{s2_image_date or today.isoformat()}.kml",
         "depth_kml_filename": f"water_depth_{s2_image_date or today.isoformat()}.kml",
     }

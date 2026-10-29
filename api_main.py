@@ -712,15 +712,21 @@ def _silt_volume_response(request: Request, result: Dict[str, Any]) -> Dict[str,
 
 
 def _water_depth_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach permanent-water (blue) and depth KML download URLs."""
+    """Attach live-water (blue) and depth KML download URLs."""
     water_id = _store_smoothed_kml(result.pop("water_kml_bytes"))
     depth_id = _store_smoothed_kml(result.pop("depth_kml_bytes"))
-    result["permanent_water"] = {
-        "kml_id": water_id,
-        "kml_download_url": _public_url(request, f"/api/water-depth/kml/{water_id}"),
-        "kml_filename": result.pop("water_kml_filename", "permanent_water.kml"),
-        "color": "#0000FF",
-    }
+    live_water = dict(result.get("live_water") or {})
+    live_water.update(
+        {
+            "kml_id": water_id,
+            "kml_download_url": _public_url(
+                request, f"/api/water-depth/kml/{water_id}"
+            ),
+            "kml_filename": result.pop("water_kml_filename", "live_water.kml"),
+            "color": "#0000FF",
+        }
+    )
+    result["live_water"] = live_water
     result["depth"]["kml_id"] = depth_id
     result["depth"]["kml_download_url"] = _public_url(
         request, f"/api/water-depth/kml/{depth_id}"
@@ -1122,11 +1128,13 @@ async def water_depth(
     ),
 ) -> Dict[str, Any]:
     """
-    Upload KML → two downloadable KMLs: blue permanent/SAR water and relative depth.
+    Upload KML → two downloadable KMLs: blue live water (S2 MNDWI frequency)
+    and relative depth.
 
-    No date input: Sentinel-1 and Sentinel-2 each use the nearest clear image
-    date in the last 30 days. Optional min/max depth set the depth scale.
-    Response includes the actual Sentinel-1 and Sentinel-2 image dates used.
+    No date input: live water uses Sentinel-2 MNDWI frequency over the last
+    30 days; depth uses the nearest clear Sentinel-2 image in that window.
+    Optional min/max depth set the depth scale.
+    Response includes the Sentinel-2 image date used for depth.
     """
     _require_earth_engine()
 
