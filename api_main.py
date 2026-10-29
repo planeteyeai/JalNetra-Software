@@ -3,8 +3,10 @@
 api_main.py — Unified JalNetra REST API.
 
 Endpoints:
-  POST /api/flood-water   — KML + date range → flood/water/area datewise (Sentinel-1)
-  POST /api/bod-cod       — KML → BOD/COD live history + 10-day forecast
+  POST /api/flood-water           — KML → flood/water datewise (fixed 1 Jun 2026→today)
+  POST /api/flood-water-dated     — KML + start/end dates → same flood buffer logic
+  POST /api/bod-cod               — river KML → BOD/COD live history + 10-day forecast
+  POST /api/streams-bod-cod       — streams KML → BOD/COD per stream placemark
 
 Usage:
     python api_main.py
@@ -47,7 +49,7 @@ sys.path.insert(0, str(HERE))
 if FLOOD_TILE_DIR.is_dir():
     sys.path.insert(0, str(FLOOD_TILE_DIR))
 
-from jalnetra.api_service import bod_cod_pipeline
+from jalnetra.api_service import bod_cod_pipeline, bod_cod_streams_pipeline
 from jalnetra.bank_erosion_service import (
     analyze_bank_erosion,
     bank_erosion_geometry,
@@ -146,25 +148,32 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# Swagger "Try it out" sends this header so ngrok free tier skips the warning page on API calls.
-_NGROK_SWAGGER_INTERCEPTOR = """
-(req) => {
-  req.headers['ngrok-skip-browser-warning'] = 'true';
-  return req;
-}
-""".strip()
+# Swagger "Try it out" sends this header so ngrok free tier skips the warning page.
+# Must be injected as real JS — swagger_ui_parameters JSON-encodes values, so a
+# string interceptor becomes a string and Swagger fails with
+# "requestInterceptor is not a function".
+_NGROK_SWAGGER_INTERCEPTOR_JS = (
+    "requestInterceptor: (req) => {"
+    " req.headers['ngrok-skip-browser-warning'] = 'true';"
+    " return req; },"
+)
 
 
 @app.get("/docs", include_in_schema=False)
 async def swagger_docs() -> HTMLResponse:
-    return get_swagger_ui_html(
+    html = get_swagger_ui_html(
         openapi_url=app.openapi_url,
         title=f"{app.title} - Swagger UI",
-        swagger_ui_parameters={
-            "persistAuthorization": True,
-            "requestInterceptor": _NGROK_SWAGGER_INTERCEPTOR,
-        },
+        swagger_ui_parameters={"persistAuthorization": True},
     )
+    body = html.body.decode("utf-8")
+    # Insert as a live function before the presets block.
+    body = body.replace(
+        "presets: [",
+        f"{_NGROK_SWAGGER_INTERCEPTOR_JS}\n    presets: [",
+        1,
+    )
+    return HTMLResponse(content=body)
 
 
 app.add_middleware(
@@ -246,7 +255,8 @@ async def root() -> Dict[str, Any]:
         "version": "1.0.0",
         "docs": "/docs",
         "endpoints": (
-            "POST /api/flood-water, POST /api/bod-cod, "
+            "POST /api/flood-water, POST /api/flood-water-dated, "
+            "POST /api/bod-cod, POST /api/streams-bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
             "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, "
@@ -289,32 +299,13 @@ def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str,
 FLOOD_DEFAULT_START_DATE = "2026-06-01"
 
 
-@app.post("/api/flood-water")
-async def flood_water(
+async def _run_flood_water_analysis(
     request: Request,
-    kml: UploadFile = File(..., description="KML file with region boundary"),
+    kml_bytes: bytes,
+    start_date: str,
+    end_date: str,
 ) -> Dict[str, Any]:
-    """
-    Upload KML → per-image flood/water areas and smoothed KMLs.
-
-    No date input: fixed range 1 June 2026 → today.
-    50 m border buffer. Pre/post dates follow Sentinel-1 image sequence.
-    No Excel / lat-lon points — class-wise water and flood hectares only.
-    """
-    _require_earth_engine()
-
-    start_date = FLOOD_DEFAULT_START_DATE
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    if start_date >= end_date:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Flood range start {start_date} must be before today ({end_date}).",
-        )
-
-    kml_bytes = await kml.read()
-    if not kml_bytes:
-        raise HTTPException(status_code=400, detail="KML file is empty.")
-
+    """Shared flood runner: permanent water 50 m border; flood red 100 m centerline."""
     try:
         from jalnetra.flood_deps.kml_utils import (
             parse_kml_plots,
@@ -348,13 +339,85 @@ async def flood_water(
     return _flood_water_response(request, result)
 
 
+@app.post("/api/flood-water")
+async def flood_water(
+    request: Request,
+    kml: UploadFile = File(..., description="KML file with region boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → per-image flood/water areas and smoothed KMLs.
+
+    No date input: fixed range 1 June 2026 → today.
+    Permanent water: 50 m border buffer (unchanged).
+    Flood (red): 100 m lateral buffer from KML centerline.
+    Pre/post dates follow Sentinel-1 image sequence.
+    """
+    _require_earth_engine()
+
+    start_date = FLOOD_DEFAULT_START_DATE
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    if start_date >= end_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Flood range start {start_date} must be before today ({end_date}).",
+        )
+
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    return await _run_flood_water_analysis(request, kml_bytes, start_date, end_date)
+
+
+@app.post("/api/flood-water-dated")
+async def flood_water_dated(
+    request: Request,
+    kml: UploadFile = File(..., description="KML file with region boundary"),
+    start_date: str = Form(..., description="Start date YYYY-MM-DD"),
+    end_date: str = Form(..., description="End date YYYY-MM-DD"),
+) -> Dict[str, Any]:
+    """
+    Upload KML + start/end dates → flood/water areas and smoothed KMLs.
+
+    Same logic as POST /api/flood-water:
+      - permanent water (blue): 50 m border buffer
+      - flood (red): 100 m lateral buffer from KML centerline
+    Caller supplies the Sentinel-1 analysis date range.
+    """
+    _require_earth_engine()
+
+    try:
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date and end_date must be YYYY-MM-DD.",
+        ) from exc
+
+    if start_date >= end_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"start_date {start_date} must be before end_date {end_date}.",
+        )
+
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    return await _run_flood_water_analysis(request, kml_bytes, start_date, end_date)
+
+
 @app.get("/api/flood-water/kml/{kml_id}")
 async def download_flood_water_kml(kml_id: str) -> Response:
     kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
         raise HTTPException(
             status_code=404,
-            detail="KML not found or expired. Run POST /api/flood-water again.",
+            detail=(
+                "KML not found or expired. "
+                "Run POST /api/flood-water or POST /api/flood-water-dated again."
+            ),
         )
     return Response(
         content=kml_bytes,
@@ -411,12 +474,15 @@ async def bod_cod(
 
 @app.get("/api/bod-cod/viewer/{viewer_id}", response_class=HTMLResponse)
 async def bod_cod_viewer(viewer_id: str) -> HTMLResponse:
-    """Interactive BOD/COD dashboard HTML for a prior POST /api/bod-cod result."""
+    """Interactive BOD/COD dashboard HTML (river or streams endpoint)."""
     payload = _DASHBOARD_CACHE.get(viewer_id)
     if payload is None:
         raise HTTPException(
             status_code=404,
-            detail="Dashboard not found or expired. Run POST /api/bod-cod again.",
+            detail=(
+                "Dashboard not found or expired. "
+                "Run POST /api/bod-cod or POST /api/streams-bod-cod again."
+            ),
         )
     return HTMLResponse(content=payload["html"])
 
@@ -428,9 +494,72 @@ async def bod_cod_viewer_data(viewer_id: str) -> Dict[str, Any]:
     if payload is None:
         raise HTTPException(
             status_code=404,
-            detail="Dashboard data not found or expired. Run POST /api/bod-cod again.",
+            detail=(
+                "Dashboard data not found or expired. "
+                "Run POST /api/bod-cod or POST /api/streams-bod-cod again."
+            ),
         )
     return payload["data"]
+
+
+@app.post("/api/streams-bod-cod")
+async def streams_bod_cod(
+    request: Request,
+    kml: UploadFile = File(
+        ..., description="KML with stream / tributary LineString or Polygon placemarks"
+    ),
+) -> Dict[str, Any]:
+    """
+    Upload streams KML → BOD/COD for each stream placemark.
+
+    One placemark → one 100 m chainage → one BOD/COD series (so you can
+    query any stream instead of the whole river). Series are daily (not
+    hourly) so large stream KMLs stay viewable in Swagger.
+    """
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        result, dashboards = await asyncio.to_thread(
+            bod_cod_streams_pipeline, kml_bytes
+        )
+        # Attach one HTML dashboard per stream (same viewer as river BOD/COD).
+        dash_by_id = {d["stream_id"]: d for d in dashboards}
+        for stream in result.get("streams") or []:
+            dash = dash_by_id.get(stream["stream_id"])
+            if not dash:
+                continue
+            viewer_id = uuid.uuid4().hex
+            data_url = _public_url(
+                request, f"/api/bod-cod/viewer/{viewer_id}/data"
+            )
+            html = _embed_dashboard_html(
+                dash["river_key"], dash["dashboard_data"], data_url=data_url
+            )
+            _DASHBOARD_CACHE[viewer_id] = {
+                "html": html,
+                "data": dash["dashboard_data"],
+                "river_key": dash["river_key"],
+                "stream_id": stream["stream_id"],
+                "stream_name": stream.get("stream_name"),
+            }
+            stream["viewer_id"] = viewer_id
+            stream["dashboard_url"] = _public_url(
+                request, f"/api/bod-cod/viewer/{viewer_id}"
+            )
+            stream["dashboard_data_url"] = data_url
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Streams BOD/COD pipeline failed: {exc}",
+        ) from exc
+
+    return result
 
 
 def _require_earth_engine() -> None:

@@ -2,7 +2,8 @@
 jalnetra.flood_water_service — Flood/water datewise overlays for JalNetra API.
 
 Wraps flood_tile Sentinel-1 logic with:
-  - 50 m border buffer
+  - 50 m border buffer (permanent water / blue — unchanged)
+  - 100 m centerline buffer for flood (red) only
   - sequential image pre/post pairs
   - smoothed KML overlays (no square borders)
   - class-wise flood/water areas only (no lat/lon, no Excel)
@@ -17,6 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from xml.dom import minidom
 
 import ee
+from pyproj import Transformer
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, mapping
+from shapely.ops import transform, unary_union
 
 from jalnetra.ee_http import read_url
 from jalnetra.flood_deps.flood_service import (
@@ -29,6 +33,7 @@ from jalnetra.flood_deps.s1_scenes import image_for_millis, scene_records
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 BUFFER_METERS = 50
+FLOOD_CENTER_BUFFER_M = 100
 DISPLAY_SCALE_M = 8
 DISPLAY_SCALE_FALLBACK = [10.0, 15.0]
 SMOOTH_RADIUS_M = 45
@@ -41,8 +46,135 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jal_flood_")
 
 
 def buffered_flood_geometry(geometry: ee.Geometry) -> ee.Geometry:
-    """50 m geodesic buffer from KML border."""
+    """50 m geodesic buffer from KML border (permanent water AOI)."""
     return geometry.buffer(BUFFER_METERS)
+
+
+def _utm_epsg(lon: float, lat: float) -> int:
+    zone = int((lon + 180) // 6) + 1
+    return (32600 if lat >= 0 else 32700) + zone
+
+
+def _coords_to_lines(coords: Any) -> List[LineString]:
+    """Flatten GeoJSON-like coordinate nests into LineStrings (≥2 vertices)."""
+    lines: List[LineString] = []
+
+    def _walk(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, (list, tuple)) or not node:
+            return
+        if isinstance(node[0], (int, float)):
+            return
+        if (
+            isinstance(node[0], (list, tuple))
+            and node[0]
+            and isinstance(node[0][0], (int, float))
+        ):
+            pts = [(float(p[0]), float(p[1])) for p in node if len(p) >= 2]
+            if len(pts) >= 2:
+                lines.append(LineString(pts))
+            return
+        for child in node:
+            _walk(child, depth + 1)
+
+    _walk(coords)
+    return lines
+
+
+def _centerline_from_polygon(poly: Polygon) -> LineString:
+    """Approximate river centerline by binning exterior points along long axis."""
+    pts = list(poly.exterior.coords)
+    if len(pts) < 2:
+        c = poly.centroid
+        return LineString([(c.x - 1e-5, c.y), (c.x + 1e-5, c.y)])
+    best_i, best_j, best_d = 0, 1, -1.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = (pts[i][0] - pts[j][0]) ** 2 + (pts[i][1] - pts[j][1]) ** 2
+            if d > best_d:
+                best_d = d
+                best_i, best_j = i, j
+    x0, y0 = pts[best_i]
+    x1, y1 = pts[best_j]
+    dx, dy = x1 - x0, y1 - y0
+    seg2 = dx * dx + dy * dy or 1e-12
+    bins: Dict[int, List[Tuple[float, float]]] = {}
+    n_bins = max(8, min(64, len(pts) // 2))
+    for x, y in pts:
+        t = max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / seg2))
+        bins.setdefault(int(t * (n_bins - 1)), []).append((x, y))
+    centers = [
+        (
+            sum(p[0] for p in bins[k]) / len(bins[k]),
+            sum(p[1] for p in bins[k]) / len(bins[k]),
+        )
+        for k in sorted(bins)
+    ]
+    if len(centers) < 2:
+        return LineString([(x0, y0), (x1, y1)])
+    return LineString(centers)
+
+
+def _shapely_from_ee_info(info: Dict[str, Any]):
+    gtype = info.get("type")
+    coords = info.get("coordinates")
+    if gtype == "Polygon":
+        return Polygon(coords[0])
+    if gtype == "MultiPolygon":
+        return MultiPolygon([Polygon(r[0]) for r in coords])
+    if gtype == "LineString":
+        return LineString(coords)
+    if gtype == "MultiLineString":
+        return MultiLineString([LineString(c) for c in coords])
+    if gtype == "GeometryCollection":
+        parts = []
+        for g in info.get("geometries") or []:
+            try:
+                parts.append(_shapely_from_ee_info(g))
+            except Exception:
+                continue
+        if not parts:
+            raise ValueError("Empty GeometryCollection.")
+        return unary_union(parts)
+    # Fallback: treat raw coordinates as polylines
+    lines = _coords_to_lines(coords)
+    if not lines:
+        raise ValueError(f"Unsupported geometry type for flood centerline: {gtype}")
+    return unary_union(lines)
+
+
+def _centerline_of(geom) -> LineString:
+    if isinstance(geom, LineString):
+        return geom
+    if isinstance(geom, MultiLineString):
+        return max(geom.geoms, key=lambda g: g.length)
+    if isinstance(geom, Polygon):
+        return _centerline_from_polygon(geom)
+    if isinstance(geom, MultiPolygon):
+        return _centerline_from_polygon(max(geom.geoms, key=lambda g: g.area))
+    # Buffer tiny geometries to get a polygon then centerline
+    return _centerline_from_polygon(geom.convex_hull if geom.geom_type == "Point" else geom.envelope)
+
+
+def flood_centerline_buffer_geometry(geometry: ee.Geometry) -> ee.Geometry:
+    """
+    100 m lateral buffer from the KML centerline (not start/end point disks).
+
+    Flat-cap buffer so flood (red) is detected within 100 m of the river centre
+    path; permanent-water AOI stays separate.
+    """
+    info = geometry.getInfo()
+    geom = _shapely_from_ee_info(info)
+    center = _centerline_of(geom)
+    clon, clat = float(center.centroid.x), float(center.centroid.y)
+    epsg = _utm_epsg(clon, clat)
+    fwd = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True).transform
+    inv = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True).transform
+    metric = transform(fwd, center)
+    # Flat caps (cap_style=2): buffer from centre path, not rounded start/end disks
+    buffered = metric.buffer(FLOOD_CENTER_BUFFER_M, cap_style=2, join_style=2)
+    wgs = transform(inv, buffered)
+    geojson = mapping(wgs)
+    return ee.Geometry(geojson)
 
 
 def _aoi_box(geometry: ee.Geometry) -> Dict[str, float]:
@@ -207,26 +339,46 @@ def _build_sequential_pairs(
 def _analyze_pair_with_kml(
     pre_image: ee.Image,
     post_image: ee.Image,
-    geometry: ee.Geometry,
+    water_aoi: ee.Geometry,
+    flood_aoi: ee.Geometry,
+    display_aoi: ee.Geometry,
     pre_date: str,
     post_date: str,
     box: Dict[str, float],
 ) -> Dict[str, Any]:
     before_filtered = ee.Image(to_db(refined_lee(to_natural(pre_image))))
     after_filtered = ee.Image(to_db(refined_lee(to_natural(post_image))))
+    # Classify over combined AOI; then keep water on border buffer and
+    # flood (red) only inside the 100 m centerline corridor.
     classification, water_mask, flood_mask = _build_classification(
-        before_filtered, after_filtered, geometry
+        before_filtered, after_filtered, display_aoi
     )
-    water_ha, flood_ha = _compute_flood_water_areas_ha(water_mask, flood_mask, geometry)
+    water_only = (
+        ee.Image(0).where(water_mask, 1).clip(water_aoi).gt(0)
+    )
+    flood_only = (
+        ee.Image(0).where(flood_mask, 1).clip(flood_aoi).gt(0)
+    )
+    water_mask = water_only.updateMask(water_only)
+    flood_mask = flood_only.updateMask(flood_only)
+    classification = (
+        ee.Image(0)
+        .where(water_mask, 1)
+        .where(flood_mask, 2)
+        .clip(display_aoi)
+    )
+    water_ha, _ = _compute_flood_water_areas_ha(water_mask, flood_mask, water_aoi)
+    _, flood_ha = _compute_flood_water_areas_ha(water_mask, flood_mask, flood_aoi)
 
-    vis = _vis_image(classification, geometry)
-    png = _export_overlay_png(vis, geometry)
+    vis = _vis_image(classification, display_aoi)
+    png = _export_overlay_png(vis, display_aoi)
     kml_bytes = _build_kml(
         title=f"Flood/Water {post_date}",
         description=(
             f"Sentinel-1 VH flood/water · pre={pre_date} · post={post_date}\n"
             f"Water: {water_ha} ha · Flood: {flood_ha} ha\n"
-            "Blue = permanent/common water · Red = flood"
+            "Blue = permanent/common water · Red = flood "
+            f"(100 m from KML centreline)"
         ),
         box=box,
         overlay_name=f"Flood {post_date}",
@@ -263,16 +415,19 @@ def analyze_flood_water_datewise(
     end_date: str,
 ) -> Dict[str, Any]:
     """
-    Buffer AOI by 50 m, run sequential S1 pairs, return class areas + KMLs.
+    Permanent water: 50 m border buffer (unchanged).
+    Flood (red): 100 m lateral buffer from KML centerline (not start/end disks).
     """
-    aoi = buffered_flood_geometry(geometry)
-    box = _aoi_box(aoi)
+    water_aoi = buffered_flood_geometry(geometry)
+    flood_aoi = flood_centerline_buffer_geometry(geometry)
+    display_aoi = water_aoi.union(flood_aoi, 1)
+    box = _aoi_box(display_aoi)
     collection = _s1_collection()
-    scenes = scene_records(collection, aoi, start_date, end_date)
+    scenes = scene_records(collection, display_aoi, start_date, end_date)
     if not scenes:
         raise ValueError("No Sentinel-1 scenes found in the selected date range.")
 
-    pairs = _build_sequential_pairs(collection, aoi, scenes)
+    pairs = _build_sequential_pairs(collection, display_aoi, scenes)
     if not pairs:
         raise ValueError(
             "No pre/post image pairs could be built "
@@ -285,7 +440,9 @@ def analyze_flood_water_datewise(
             _analyze_pair_with_kml,
             p["pre_image"],
             p["post_image"],
-            aoi,
+            water_aoi,
+            flood_aoi,
+            display_aoi,
             p["pre_date"],
             p["post_date"],
             box,
@@ -303,6 +460,7 @@ def analyze_flood_water_datewise(
         "start_date": start_date,
         "end_date": end_date,
         "buffer_m": BUFFER_METERS,
+        "flood_center_buffer_m": FLOOD_CENTER_BUFFER_M,
         "scene_count": len(scenes),
         "comparison_count": len(datewise),
         "datewise": datewise,
@@ -311,10 +469,15 @@ def analyze_flood_water_datewise(
             "1st image pre = previous S1 before that date; "
             "later images pre = previous image in the series. "
             "water = VH < -20 dB both scenes; "
-            "flood = VH > -20 dB pre and < -20 dB post."
+            "flood = VH > -20 dB pre and < -20 dB post, "
+            "clipped to 100 m centerline corridor."
         ),
         "notes": {
-            "buffer": "50 m from KML border",
+            "water_buffer": "50 m from KML border (permanent water unchanged)",
+            "flood_buffer": (
+                "100 m lateral from KML centerline "
+                "(flat caps — not start/end point disks)"
+            ),
             "areas": "Class-wise water and flood hectares only (not whole KML area)",
             "smoothing": "focal_mode + fine export grid — no square borders",
         },

@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,7 +24,7 @@ from jalnetra.dashboard import _expand_hourly, _r, _scale_series, export_json
 from jalnetra.forecast import hindcast_skill, make_forecast
 from jalnetra.fusion import run_twin
 from jalnetra.ingestion import DemoSource, build_matchups
-from jalnetra.kml_locator import locate_kml
+from jalnetra.kml_locator import CHAINAGE_STEP_KM, locate_kml
 from jalnetra.retrieval import classify_bod, detect_anomalies, train_all
 from jalnetra.synthetic import rainfall_forecast
 from jalnetra.trust import blind_metrics, build_alerts
@@ -73,8 +74,8 @@ RIVER_DASHBOARD_META: Dict[str, Dict[str, Any]] = {
         "landmarks": [],
         "demo_notice": (
             "CUSTOM RIVER SYNTHETIC DEMO — reaches and chainage from KML "
-            "as fixed 2 km segments (0–2, 2–4, …). Figures validate software, not "
-            "real-world accuracy."
+            "as fixed 100 m segments (0–0.1, 0.1–0.2, …). Figures validate "
+            "software, not real-world accuracy."
         ),
     },
 }
@@ -219,13 +220,24 @@ def _reach_series(
     )
 
 
-def bod_cod_pipeline(kml_bytes: bytes) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+def bod_cod_pipeline(
+    kml_bytes: bytes,
+    *,
+    chainage_step_km: float = CHAINAGE_STEP_KM,
+    force_total_km: Optional[float] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """
     Run JalNetra pipeline for KML-detected river.
 
     Returns (api_payload, dashboard_json, river_key).
+    chainage_step_km defaults to 100 m. Streams API may force one 100 m
+    chainage per stream via force_total_km=chainage_step_km.
     """
-    location = locate_kml(kml_bytes)
+    location = locate_kml(
+        kml_bytes,
+        chainage_step_km=chainage_step_km,
+        force_total_km=force_total_km,
+    )
     profile = location.profile
     river_key = profile.key
 
@@ -386,3 +398,241 @@ def bod_cod_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
     """Run pipeline and return API payload only (backward compatible)."""
     api_payload, _, _ = bod_cod_pipeline(kml_bytes)
     return api_payload
+
+
+# ---------------------------------------------------------------------------
+# Streams BOD/COD (additive; does not alter river API) — KML input only
+# ---------------------------------------------------------------------------
+
+
+def _local_tag(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _placemark_name(pm: ET.Element, fallback: str) -> str:
+    for child in list(pm):
+        if _local_tag(child.tag) == "name" and child.text and child.text.strip():
+            return child.text.strip()
+    return fallback
+
+
+def _placemark_has_path_geometry(pm: ET.Element) -> bool:
+    """True if placemark has a stream-like LineString or Polygon path."""
+    for elem in pm.iter():
+        tag = _local_tag(elem.tag)
+        if tag in ("LineString", "Polygon"):
+            return True
+    return False
+
+
+# Streams use one 100 m chainage per placemark (same step as river BOD/COD).
+_STREAM_CHAINAGE_KM = CHAINAGE_STEP_KM
+
+
+def _coords_from_kml(kml_bytes: bytes) -> List[Tuple[float, float]]:
+    try:
+        root = ET.fromstring(kml_bytes)
+    except ET.ParseError:
+        return []
+    pts: List[Tuple[float, float]] = []
+    for elem in root.iter():
+        if _local_tag(elem.tag) != "coordinates":
+            continue
+        if not elem.text or not elem.text.strip():
+            continue
+        for token in elem.text.strip().split():
+            parts = token.split(",")
+            if len(parts) >= 2:
+                pts.append((float(parts[0]), float(parts[1])))
+    return pts
+
+
+def _ensure_stream_kml(kml_bytes: bytes, name: str) -> bytes:
+    """Validate stream geometry has coordinates; keep original path (no 6 km pad)."""
+    pts = _coords_from_kml(kml_bytes)
+    if not pts:
+        raise ValueError(f"No coordinates found for stream '{name}'.")
+    return kml_bytes
+
+
+def _wrap_placemark_kml(name: str, placemark_xml: str) -> bytes:
+    safe_name = (name or "Stream").replace("&", "&amp;").replace("<", "&lt;")
+    doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<kml xmlns="http://www.opengis.net/kml/2.2">'
+        f"<Document><name>{safe_name}</name>{placemark_xml}</Document>"
+        "</kml>"
+    )
+    return doc.encode("utf-8")
+
+
+def _extract_stream_features(kml_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Split a streams KML into one mini-KML per stream placemark.
+
+    Prefer Placemarks that carry LineString/Polygon geometry (tributaries /
+    stream reaches). If none are found, the whole upload is treated as one
+    stream so the existing river BOD/COD pipeline still runs unchanged.
+    Each stream maps to exactly one 100 m chainage.
+    """
+    try:
+        root = ET.fromstring(kml_bytes)
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid KML file: {exc}") from exc
+
+    features: List[Dict[str, Any]] = []
+    for pm in root.iter():
+        if _local_tag(pm.tag) != "Placemark":
+            continue
+        if not _placemark_has_path_geometry(pm):
+            continue
+        idx = len(features) + 1
+        name = _placemark_name(pm, f"Stream {idx}")
+        xml = ET.tostring(pm, encoding="unicode")
+        mini = _wrap_placemark_kml(name, xml)
+        features.append(
+            {
+                "stream_id": f"S{idx:02d}",
+                "stream_name": name,
+                "kml_bytes": _ensure_stream_kml(mini, name),
+            }
+        )
+
+    if not features:
+        features.append(
+            {
+                "stream_id": "S01",
+                "stream_name": "Stream",
+                "kml_bytes": _ensure_stream_kml(kml_bytes, "Stream"),
+            }
+        )
+    return features
+
+
+def _series_to_daily(block: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Collapse hourly live/forecast arrays to one sample per day (noon).
+
+    Streams responses multiply series by placemark count; hourly payloads
+    routinely freeze Swagger UI, so streams API returns daily only.
+    """
+    if not block:
+        return block
+    if block.get("resolution") != "hourly":
+        return block
+
+    dates = block.get("dates") or []
+    if not dates:
+        return block
+
+    # Prefer 12:00 samples from "%Y-%m-%dT%H:%M"; else every 24th point.
+    indices = [
+        i
+        for i, d in enumerate(dates)
+        if isinstance(d, str) and "T12:" in d
+    ]
+    if not indices:
+        indices = list(range(0, len(dates), 24))
+
+    out: Dict[str, Any] = {"resolution": "daily"}
+    for key, val in block.items():
+        if key == "resolution":
+            continue
+        if isinstance(val, list) and len(val) == len(dates):
+            sampled = [val[i] for i in indices if i < len(val)]
+            if key == "dates":
+                # Normalize to YYYY-MM-DD for daily resolution
+                out[key] = [
+                    (s[:10] if isinstance(s, str) and len(s) >= 10 else s)
+                    for s in sampled
+                ]
+            else:
+                out[key] = sampled
+        else:
+            out[key] = val
+    return out
+
+
+def _slim_stream_location(loc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not loc:
+        return loc
+    return {
+        "river": loc.get("river"),
+        "reach_id": loc.get("reach_id"),
+        "reach_name": loc.get("reach_name"),
+        "chainage_km": loc.get("chainage_km"),
+        "latitude": loc.get("latitude"),
+        "longitude": loc.get("longitude"),
+    }
+
+
+def bod_cod_streams_pipeline(
+    kml_bytes: bytes,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Streams KML → BOD/COD per stream placemark.
+
+    One stream placemark → one 100 m chainage → one BOD/COD series, so
+    stream_count == chainage count. Reuses bod_cod_pipeline() per feature.
+    Response uses daily (not hourly) series for Swagger usability.
+
+    Returns (api_payload, dashboards) where dashboards is a parallel list of
+    {stream_id, stream_name, dashboard_data, river_key} for HTML viewers.
+    Dashboard JSON is NOT embedded in api_payload (keeps Swagger usable).
+    """
+    features = _extract_stream_features(kml_bytes)
+    today_str = _api_today().strftime("%Y-%m-%d")
+    streams: List[Dict[str, Any]] = []
+    dashboards: List[Dict[str, Any]] = []
+
+    for feat in features:
+        # Exactly one 100 m chainage per stream placemark.
+        payload, dashboard_data, river_key = bod_cod_pipeline(
+            feat["kml_bytes"],
+            chainage_step_km=_STREAM_CHAINAGE_KM,
+            force_total_km=_STREAM_CHAINAGE_KM,
+        )
+        loc = _slim_stream_location(payload.get("location"))
+        if loc is not None:
+            loc["chainage_step_m"] = int(_STREAM_CHAINAGE_KM * 1000)
+            loc["chainage_count"] = 1
+        streams.append(
+            {
+                "stream_id": feat["stream_id"],
+                "stream_name": feat["stream_name"],
+                "forecast_from": payload.get("forecast_from"),
+                "forecast_to": payload.get("forecast_to"),
+                "forecast_days": payload.get("forecast_days"),
+                "history_days": payload.get("history_days"),
+                "location": loc,
+                "today": payload.get("today"),
+                "live": _series_to_daily(payload.get("live")),
+                "forecast": _series_to_daily(payload.get("forecast")),
+            }
+        )
+        dashboards.append(
+            {
+                "stream_id": feat["stream_id"],
+                "stream_name": feat["stream_name"],
+                "dashboard_data": dashboard_data,
+                "river_key": river_key,
+            }
+        )
+
+    result = {
+        "generated": today_str,
+        "data_refreshed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "demo_notice": (
+            "SYNTHETIC DEMO DATA — one 100 m chainage and BOD/COD series per "
+            "stream placemark; figures validate software, not real-world "
+            "water-quality accuracy. Series are daily (not hourly) "
+            "to keep the response usable."
+        ),
+        "input_type": "streams_kml",
+        "resolution": "daily",
+        "chainage_step_m": int(_STREAM_CHAINAGE_KM * 1000),
+        "stream_count": len(streams),
+        "chainage_count": len(streams),
+        "streams": streams,
+    }
+    return result, dashboards

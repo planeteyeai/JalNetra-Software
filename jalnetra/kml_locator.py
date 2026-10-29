@@ -1,9 +1,10 @@
 """
 jalnetra.kml_locator — parse uploaded KML and build river reach / chainage.
 
-BOD/COD chainage uses fixed 2 km segments along the KML axis (0–2, 2–4, …)
-for the uploaded river length. Each uploaded river gets its own synthetic demo
-seed from the centroid so responses differ by KML (e.g. Godavari ≠ Mithi).
+BOD/COD chainage uses fixed 100 m (0.1 km) segments along the KML axis
+(0–0.1, 0.1–0.2, …) for the uploaded river length. Each uploaded river gets
+its own synthetic demo seed from the centroid so responses differ by KML
+(e.g. Godavari ≠ Mithi).
 """
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from .config import Reach
+
+# BOD/COD chainage step along the river axis (was 2.0 km).
+CHAINAGE_STEP_KM = 0.1
 
 
 @dataclass
@@ -664,9 +668,9 @@ def _fmt_km(km: float) -> str:
 def _build_reaches_from_2km_chainage(
     total_km: float,
     *,
-    step_km: float = 2.0,
+    step_km: float = CHAINAGE_STEP_KM,
 ) -> Tuple[List[Reach], List[Tuple[str, float]]]:
-    """Split the KML river axis into fixed 2 km chainage reaches: 0–2, 2–4, …"""
+    """Split the KML river axis into fixed chainage reaches (default 100 m)."""
     total = max(float(total_km), step_km)
     n = max(1, int(math.ceil(total / step_km)))
     reaches: List[Reach] = []
@@ -679,7 +683,11 @@ def _build_reaches_from_2km_chainage(
             b = round(a + step_km, 2)
         name = f"{_fmt_km(a)}–{_fmt_km(b)} km"
         rid = f"R{i + 1:02d}"
-        od = 0.35 + 0.5 * (i / max(1, n - 1))
+        # Ensure ≥1 hot reach (outfall_density > 0.5) for synthetic demo.
+        if n == 1:
+            od = 0.6
+        else:
+            od = 0.35 + 0.5 * (i / max(1, n - 1))
         r = Reach(rid, name, a, b, 70.0 + 5 * i, round(od, 2), upstream=prev)
         r.villages = name  # type: ignore[attr-defined]
         reaches.append(r)
@@ -782,12 +790,18 @@ class KmlLocation:
     bridges: Optional[List[Tuple[str, float]]] = None
 
 
-def locate_kml(kml_bytes: bytes) -> KmlLocation:
+def locate_kml(
+    kml_bytes: bytes,
+    *,
+    chainage_step_km: float = CHAINAGE_STEP_KM,
+    force_total_km: Optional[float] = None,
+) -> KmlLocation:
     """
     Build river profile from uploaded KML.
 
     Uses river name guessed from KML text (Document/Folder/placemark names).
-    Chainage is fixed 2 km segments along the KML axis (0–2, 2–4, …).
+    Chainage is fixed 100 m segments along the KML axis (0–0.1, 0.1–0.2, …)
+    unless chainage_step_km / force_total_km override (streams API).
     Synthetic demo seed is unique per centroid.
     """
     try:
@@ -816,9 +830,14 @@ def locate_kml(kml_bytes: bytes) -> KmlLocation:
         pts = [(float(p[0]), float(p[1])) for p in ring]
         path_km = max(path_km, _polygon_bank_length_km(pts))
     center_km = _centerline_length_km(axis_pts, axis_start, axis_end, span_km)
-    total_km = round(max(path_km, center_km, span_km, 0.5), 2)
-    # BOD/COD chainage: fixed 2 km reaches for this KML (0–2, 2–4, …)
-    reaches, landmarks = _build_reaches_from_2km_chainage(total_km)
+    if force_total_km is not None:
+        total_km = round(max(float(force_total_km), chainage_step_km), 2)
+    else:
+        total_km = round(max(path_km, center_km, span_km, chainage_step_km), 2)
+    # BOD/COD chainage: fixed step reaches for this KML (default 100 m)
+    reaches, landmarks = _build_reaches_from_2km_chainage(
+        total_km, step_km=chainage_step_km
+    )
     seed = _seed_from_centroid(lon, lat)
     holdout = reaches[len(reaches) // 2].reach_id
 
