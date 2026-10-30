@@ -636,3 +636,104 @@ def bod_cod_streams_pipeline(
         "streams": streams,
     }
     return result, dashboards
+
+
+# ---------------------------------------------------------------------------
+# Drainage BOD/COD (additive) — main stream + sub streams from drainage KMLs
+# ---------------------------------------------------------------------------
+
+
+def drainage_bod_cod_pipeline(
+    main_kml_bytes: bytes,
+    sub_kml_bytes: bytes,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Main-stream KML + sub-stream (upstreams) KML → BOD/COD.
+
+    - Main stream: same as POST /api/bod-cod (100 m chainage, hourly series).
+    - Each sub-stream placemark: one 100 m chainage, hourly series (same
+      resolution as the main-stream BOD/COD API).
+
+    Returns (api_payload, main_dashboard, sub_dashboards).
+    """
+    main_payload, main_dashboard, main_river_key = bod_cod_pipeline(
+        main_kml_bytes,
+        chainage_step_km=CHAINAGE_STEP_KM,
+    )
+
+    features = _extract_stream_features(sub_kml_bytes)
+    today_str = _api_today().strftime("%Y-%m-%d")
+    sub_streams: List[Dict[str, Any]] = []
+    sub_dashboards: List[Dict[str, Any]] = []
+
+    for feat in features:
+        payload, dashboard_data, river_key = bod_cod_pipeline(
+            feat["kml_bytes"],
+            chainage_step_km=_STREAM_CHAINAGE_KM,
+            force_total_km=_STREAM_CHAINAGE_KM,
+        )
+        loc = _slim_stream_location(payload.get("location"))
+        if loc is not None:
+            loc["chainage_step_m"] = int(_STREAM_CHAINAGE_KM * 1000)
+            loc["chainage_count"] = 1
+        sub_streams.append(
+            {
+                "stream_id": feat["stream_id"],
+                "stream_name": feat["stream_name"],
+                "forecast_from": payload.get("forecast_from"),
+                "forecast_to": payload.get("forecast_to"),
+                "forecast_days": payload.get("forecast_days"),
+                "history_days": payload.get("history_days"),
+                "location": loc,
+                "today": payload.get("today"),
+                # Keep hourly — same as main-stream BOD/COD (not daily collapse).
+                "live": payload.get("live"),
+                "forecast": payload.get("forecast"),
+            }
+        )
+        sub_dashboards.append(
+            {
+                "stream_id": feat["stream_id"],
+                "stream_name": feat["stream_name"],
+                "dashboard_data": dashboard_data,
+                "river_key": river_key,
+            }
+        )
+
+    result = {
+        "generated": today_str,
+        "data_refreshed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "demo_notice": (
+            "SYNTHETIC DEMO DATA — drainage main stream uses 100 m chainage "
+            "with hourly BOD/COD; each sub-stream placemark has one 100 m "
+            "chainage with hourly BOD/COD (same as /api/bod-cod). "
+            "Figures validate software, not real-world water-quality accuracy."
+        ),
+        "input_type": "drainage_kml_ids",
+        "chainage_step_m": int(CHAINAGE_STEP_KM * 1000),
+        "main_stream": {
+            "river_key": main_river_key,
+            "resolution": "hourly",
+            **{
+                k: main_payload[k]
+                for k in (
+                    "forecast_from",
+                    "forecast_to",
+                    "forecast_days",
+                    "history_days",
+                    "location",
+                    "today",
+                    "live",
+                    "forecast",
+                )
+                if k in main_payload
+            },
+        },
+        "sub_stream": {
+            "resolution": "hourly",
+            "stream_count": len(sub_streams),
+            "chainage_count": len(sub_streams),
+            "streams": sub_streams,
+        },
+    }
+    return result, main_dashboard, sub_dashboards
