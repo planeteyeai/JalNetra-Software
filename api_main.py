@@ -93,14 +93,16 @@ from jalnetra.water_quality_service import (
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
-_KML_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
+# KML download links stay valid for 30 minutes after the API response is built.
+_KML_TTL_S = 30 * 60
+_KML_CACHE: TTLCache = TTLCache(maxsize=200, ttl=_KML_TTL_S)
 _TIF_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 # Drainage KML id → "main_stream" | "sub_stream" (auto-detect for BOD/COD).
 _DRAINAGE_KIND: TTLCache = TTLCache(maxsize=200, ttl=3600)
 # Disk-backed KML store — survives uvicorn --reload (in-memory cache alone does not).
 _KML_DISK_DIR = HERE / ".kml_cache"
 _KML_DISK_DIR.mkdir(exist_ok=True)
-_KML_DISK_TTL_S = 3600
+_KML_DISK_TTL_S = _KML_TTL_S
 
 RIVER_DASHBOARD_DIRS = {
     "mithi": HERE / "dashboard" / "mithi",
@@ -2062,6 +2064,8 @@ if __name__ == "__main__":
             host="0.0.0.0",
             port=port,
             reload=True,
+            # Writing KMLs must not restart the server (that drops in-memory cache).
+            reload_excludes=[".kml_cache/*", "**/.kml_cache/**"],
         )
     except OSError as exc:
         if getattr(exc, "winerror", None) == 10013 or "10048" in str(exc):
