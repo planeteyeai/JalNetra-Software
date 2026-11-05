@@ -72,6 +72,13 @@ from jalnetra.kml_pixel_smoother import smooth_kml_bytes
 from jalnetra.lithology_service import analyze_lithology, lithology_geometry
 from jalnetra.lulc_service import analyze_lulc, lulc_analysis_geometry
 from jalnetra.salinity_service import analyze_salinity, salinity_geometry
+from jalnetra.satellite_wq_service import (
+    MAX_CLOUD_S2 as SAT_WQ_MAX_CLOUD,
+    analyze_coliform,
+    analyze_eutrophication,
+    analyze_nitrogen,
+    satellite_wq_geometry,
+)
 from jalnetra.scene_dates import recent_window, select_clear_s2_date
 from jalnetra.silt_service import analyze_silt, silt_geometry
 from jalnetra.vegetation_service import (
@@ -275,7 +282,8 @@ async def root() -> Dict[str, Any]:
             "POST /api/drainage, POST /api/drainage/bod-cod, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
-            "POST /api/water-quality, POST /api/water-depth, POST /api/lithology, "
+            "POST /api/water-quality, POST /api/eutrophication, POST /api/nitrogen, "
+            "POST /api/coliform, POST /api/water-depth, POST /api/lithology, "
             "POST /api/silt-classification, POST /api/silt-volume, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
             "POST /api/fabdem-dtm-raw, POST /api/copernicus-dsm, "
@@ -1368,6 +1376,174 @@ async def download_water_quality_kml(kml_id: str) -> Response:
     )
 
 
+async def _run_satellite_wq(
+    request: Request,
+    kml: UploadFile,
+    *,
+    analyze_fn,
+    prefix: str,
+    filename: str,
+    fail_label: str,
+) -> Dict[str, Any]:
+    """Shared runner: nearest clear S2 (<20% cloud) + pixel-smoothed KML."""
+    _require_earth_engine()
+
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        aoi_geom, aoi_info = await asyncio.to_thread(satellite_wq_geometry, kml_bytes)
+        # select_clear uses lte; pass just under 20 so selection matches Filter.lt(20).
+        scene = await asyncio.to_thread(
+            select_clear_s2_date,
+            aoi_geom,
+            max_cloud_pct=SAT_WQ_MAX_CLOUD - 1e-6,
+        )
+        result = await asyncio.to_thread(
+            analyze_fn,
+            aoi_geom,
+            scene["start_date"],
+            scene["end_date"],
+            aoi_info=aoi_info,
+            no2_window=recent_window(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"{fail_label} analysis failed: {exc}"
+        ) from exc
+
+    result["scene_selection"] = scene
+    return await asyncio.to_thread(
+        _vegetation_response,
+        request,
+        result,
+        prefix=prefix,
+        filename=filename,
+        smooth=True,
+    )
+
+
+@app.post("/api/eutrophication")
+async def eutrophication(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → eutrophication (Carlson TSI trophic class from chlorophyll-a).
+
+    No date input: nearest clear Sentinel-2 date with tile cloud < 20%.
+    Returns class-wise areas (JSON) and a pixel-smoothed downloadable KML.
+    """
+    return await _run_satellite_wq(
+        request,
+        kml,
+        analyze_fn=analyze_eutrophication,
+        prefix="eutrophication",
+        filename="eutrophication_trophic_class.kml",
+        fail_label="Eutrophication",
+    )
+
+
+@app.get("/api/eutrophication/kml/{kml_id}")
+async def download_eutrophication_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/eutrophication again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="eutrophication_trophic_class.kml"'
+            )
+        },
+    )
+
+
+@app.post("/api/nitrogen")
+async def nitrogen(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → high-nitrogen risk class (not mg N/L).
+
+    Chlorophyll + WorldCover land sources + Sentinel-5P NO2.
+    No date input: nearest clear Sentinel-2 date with tile cloud < 20%.
+    Returns class-wise areas (JSON) and a pixel-smoothed downloadable KML.
+    """
+    return await _run_satellite_wq(
+        request,
+        kml,
+        analyze_fn=analyze_nitrogen,
+        prefix="nitrogen",
+        filename="nitrogen_risk_class.kml",
+        fail_label="Nitrogen",
+    )
+
+
+@app.get("/api/nitrogen/kml/{kml_id}")
+async def download_nitrogen_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/nitrogen again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="nitrogen_risk_class.kml"'
+        },
+    )
+
+
+@app.post("/api/coliform")
+async def coliform(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → E. coli / coliform bathing class (relative rank).
+
+    SWIR/blue FIB features (Chowdhury 2025) blended with urban pressure.
+    No date input: nearest clear Sentinel-2 date with tile cloud < 20%.
+    Returns class-wise areas (JSON) and a pixel-smoothed downloadable KML.
+    """
+    return await _run_satellite_wq(
+        request,
+        kml,
+        analyze_fn=analyze_coliform,
+        prefix="coliform",
+        filename="coliform_ecoli_class.kml",
+        fail_label="Coliform",
+    )
+
+
+@app.get("/api/coliform/kml/{kml_id}")
+async def download_coliform_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/coliform again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="coliform_ecoli_class.kml"'
+        },
+    )
+
+
 @app.post("/api/water-depth")
 async def water_depth(
     request: Request,
@@ -1764,6 +1940,9 @@ ALL_API_NAMES = (
     "salinity",
     "bank_erosion",
     "water_quality",
+    "eutrophication",
+    "nitrogen",
+    "coliform",
     "water_depth",
     "lithology",
     "silt_classification",
@@ -1815,6 +1994,9 @@ async def all_apis(
         "salinity": lambda: salinity(request, upload()),
         "bank_erosion": lambda: bank_erosion(request, upload()),
         "water_quality": lambda: water_quality(request, upload()),
+        "eutrophication": lambda: eutrophication(request, upload()),
+        "nitrogen": lambda: nitrogen(request, upload()),
+        "coliform": lambda: coliform(request, upload()),
         "water_depth": lambda: water_depth(request, upload(), depth_min_m, depth_max_m),
         "lithology": lambda: lithology(request, upload()),
         "silt_classification": lambda: silt_classification(request, upload()),
