@@ -5,17 +5,16 @@ api_main.py — Unified JalNetra REST API.
 Endpoints:
   POST /api/flood-water           — KML → flood/water datewise (fixed 1 Jun 2026→today)
   POST /api/flood-water-dated     — KML + start/end dates → same flood buffer logic
-  POST /api/bod-cod               — river KML → BOD/COD live history + 10-day forecast
-  POST /api/streams-bod-cod       — streams KML → BOD/COD per stream placemark
+  POST /api/main-bod-cod          — stream KML → daily BOD/COD (Landsat Wang + S2 COD)
+  POST /api/streams-bod-cod       — joining/sub-stream KML → per-stream BOD/COD + pixels
   POST /api/drainage              — polygon KML → main-stream + sub-stream KMLs
-  POST /api/drainage/bod-cod      — drainage KML ids → main + sub BOD/COD (hourly)
 
 Usage:
     python api_main.py
     EE_SERVICE_ACCOUNT_JSON='...' python api_main.py   # flood endpoint needs GEE
 
 Flood logic reuses ../flood_tile (Sentinel-1 SAR).
-BOD/COD logic reuses jalnetra demo pipeline (synthetic demo data).
+Main/streams BOD/COD uses Landsat 8/9 TOA + Sentinel-2 (GEE).
 Vegetation type/health uses Sentinel-2 + Dynamic World (GEE).
 """
 
@@ -51,15 +50,11 @@ sys.path.insert(0, str(HERE))
 if FLOOD_TILE_DIR.is_dir():
     sys.path.insert(0, str(FLOOD_TILE_DIR))
 
-from jalnetra.api_service import (
-    bod_cod_pipeline,
-    bod_cod_streams_pipeline,
-    drainage_bod_cod_pipeline,
-)
 from jalnetra.bank_erosion_service import (
     analyze_bank_erosion,
     bank_erosion_geometry,
 )
+from jalnetra.bod_cod_service import analyze_main_bod_cod, analyze_streams_bod_cod
 from jalnetra.drainage_service import DrainageError, analyze_drainage
 from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
@@ -91,26 +86,15 @@ from jalnetra.water_quality_service import (
     water_quality_geometry,
 )
 
-_DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
 # KML download links stay valid for 30 minutes after the API response is built.
 _KML_TTL_S = 30 * 60
 _KML_CACHE: TTLCache = TTLCache(maxsize=200, ttl=_KML_TTL_S)
 _TIF_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
-# Drainage KML id → "main_stream" | "sub_stream" (auto-detect for BOD/COD).
-_DRAINAGE_KIND: TTLCache = TTLCache(maxsize=200, ttl=3600)
 # Disk-backed KML store — survives uvicorn --reload (in-memory cache alone does not).
 _KML_DISK_DIR = HERE / ".kml_cache"
 _KML_DISK_DIR.mkdir(exist_ok=True)
 _KML_DISK_TTL_S = _KML_TTL_S
-
-RIVER_DASHBOARD_DIRS = {
-    "mithi": HERE / "dashboard" / "mithi",
-    "mula_mutha": HERE / "dashboard" / "mula_mutha",
-    "ganga_pilot": HERE / "dashboard",
-    # Any uploaded river (Godavari, etc.) — same HTML shell, unique JSON data
-    "custom": HERE / "dashboard" / "mithi",
-}
 
 
 def _init_earth_engine() -> None:
@@ -184,7 +168,7 @@ async def swagger_docs() -> HTMLResponse:
         title=f"{app.title} - Swagger UI",
         swagger_ui_parameters={
             "persistAuthorization": True,
-            # Large hourly BOD/COD payloads crash Swagger's highlighter
+            # Large multi-chainage payloads can crash Swagger's highlighter
             # ("Could not render responses_Responses").
             "syntaxHighlight": {"activated": False},
             "defaultModelsExpandDepth": -1,
@@ -232,28 +216,6 @@ def _geojson_centroid(
     return round(lat, 6), round(lon, 6)
 
 
-def _embed_dashboard_html(
-    river_key: str, data: Dict[str, Any], *, data_url: str
-) -> str:
-    dash_dir = RIVER_DASHBOARD_DIRS.get(river_key, HERE / "dashboard")
-    html_path = dash_dir / "dashboard.html"
-    if not html_path.is_file():
-        raise FileNotFoundError(f"Dashboard template not found: {html_path}")
-    html = html_path.read_text(encoding="utf-8")
-    html = html.replace(
-        "fetch('dashboard_data.json?t=' + Date.now()",
-        f"fetch('{data_url}?t=' + Date.now()",
-    )
-    marker = '<script id="fallback" type="application/json">'
-    end = "</script>"
-    i = html.find(marker)
-    if i < 0:
-        raise ValueError("Dashboard template missing fallback JSON marker.")
-    j = html.find(end, i)
-    payload = json.dumps(data, separators=(",", ":"))
-    return html[: i + len(marker)] + payload + html[j:]
-
-
 def _public_url(request: Request, path: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}{path}"
@@ -280,8 +242,7 @@ async def root() -> Dict[str, Any]:
         "docs": "/docs",
         "endpoints": (
             "POST /api/flood-water, POST /api/flood-water-dated, "
-            "POST /api/bod-cod, POST /api/streams-bod-cod, "
-            "POST /api/drainage, POST /api/drainage/bod-cod, "
+            "POST /api/main-bod-cod, POST /api/streams-bod-cod, POST /api/drainage, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
             "POST /api/water-quality, POST /api/eutrophication, POST /api/nitrogen, "
@@ -452,140 +413,127 @@ async def download_flood_water_kml(kml_id: str) -> Response:
     )
 
 
-@app.post("/api/bod-cod")
-async def bod_cod(
+def _main_bod_cod_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
+    kml_bytes = result.pop("kml_bytes")
+    kml_id = uuid.uuid4().hex
+    _put_cached_kml(kml_id, kml_bytes)
+    result["kml_id"] = kml_id
+    result["kml_download_url"] = _public_url(
+        request, f"/api/main-bod-cod/kml/{kml_id}"
+    )
+    return result
+
+
+@app.post("/api/main-bod-cod")
+async def main_bod_cod(
     request: Request,
-    kml: UploadFile = File(..., description="KML river patch"),
+    kml: UploadFile = File(
+        ..., description="Main-stream / joining-stream KML (LineString placemarks)"
+    ),
 ) -> Dict[str, Any]:
     """
-    Upload KML → BOD/COD for that river (unique per KML).
+    Upload stream KML → daily BOD/COD at 10 m chainage.
 
-    River name and bridge / placemark names from the KML drive chainage and
-    reach labels. Returns live history, today's snapshot, 10-day forecast,
-    and a dashboard_url for an HTML viewer titled for that river.
+    BOD from Landsat 8+9 TOA (Wang + local calibration).
+    COD from BOD×ratio + Sentinel-2 TSS/NDCI correction.
+    One value per Landsat acquisition day (not hourly). Returns per-stream
+    mean/min/max, daily chainage series, and a downloadable pixel KML.
     """
+    _require_earth_engine()
+
     kml_bytes = await kml.read()
     if not kml_bytes:
         raise HTTPException(status_code=400, detail="KML file is empty.")
 
     try:
-        result, dashboard_data, river_key = await asyncio.to_thread(
-            bod_cod_pipeline, kml_bytes
-        )
-        viewer_id = uuid.uuid4().hex
-        data_url = _public_url(request, f"/api/bod-cod/viewer/{viewer_id}/data")
-        html = _embed_dashboard_html(river_key, dashboard_data, data_url=data_url)
-        _DASHBOARD_CACHE[viewer_id] = {
-            "html": html,
-            "data": dashboard_data,
-            "river_key": river_key,
-        }
-        result["viewer_id"] = viewer_id
-        result["dashboard_url"] = _public_url(
-            request, f"/api/bod-cod/viewer/{viewer_id}"
-        )
-        result["dashboard_data_url"] = data_url
+        result = await asyncio.to_thread(analyze_main_bod_cod, kml_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"BOD/COD pipeline failed: {exc}",
+            detail=f"Main BOD/COD analysis failed: {exc}",
         ) from exc
 
+    return await asyncio.to_thread(_main_bod_cod_response, request, result)
+
+
+@app.get("/api/main-bod-cod/kml/{kml_id}")
+async def download_main_bod_cod_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/main-bod-cod again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="main_bod_cod_pixels.kml"'
+        },
+    )
+
+
+def _streams_bod_cod_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
+    kml_bytes = result.pop("kml_bytes")
+    kml_id = uuid.uuid4().hex
+    _put_cached_kml(kml_id, kml_bytes)
+    result["kml_id"] = kml_id
+    result["kml_download_url"] = _public_url(
+        request, f"/api/streams-bod-cod/kml/{kml_id}"
+    )
     return result
-
-
-@app.get("/api/bod-cod/viewer/{viewer_id}", response_class=HTMLResponse)
-async def bod_cod_viewer(viewer_id: str) -> HTMLResponse:
-    """Interactive BOD/COD dashboard HTML (river or streams endpoint)."""
-    payload = _DASHBOARD_CACHE.get(viewer_id)
-    if payload is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Dashboard not found or expired. "
-                "Run POST /api/bod-cod or POST /api/streams-bod-cod again."
-            ),
-        )
-    return HTMLResponse(content=payload["html"])
-
-
-@app.get("/api/bod-cod/viewer/{viewer_id}/data")
-async def bod_cod_viewer_data(viewer_id: str) -> Dict[str, Any]:
-    """JSON data backing the BOD/COD dashboard viewer."""
-    payload = _DASHBOARD_CACHE.get(viewer_id)
-    if payload is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Dashboard data not found or expired. "
-                "Run POST /api/bod-cod or POST /api/streams-bod-cod again."
-            ),
-        )
-    return payload["data"]
 
 
 @app.post("/api/streams-bod-cod")
 async def streams_bod_cod(
     request: Request,
     kml: UploadFile = File(
-        ..., description="KML with stream / tributary LineString or Polygon placemarks"
+        ..., description="Joining / sub-stream KML (LineString placemarks)"
     ),
 ) -> Dict[str, Any]:
     """
-    Upload streams KML → BOD/COD for each stream placemark.
+    Upload joining-stream KML → per-stream BOD/COD + every pixel lat/lon.
 
-    One placemark → one 100 m chainage → one BOD/COD series (so you can
-    query any stream instead of the whole river). Series are daily (not
-    hourly) so large stream KMLs stay viewable in Swagger.
+    Same Landsat Wang BOD + Sentinel-2 COD correction as main, with a
+    relaxed water mask for narrow streams. Returns mean/min/max per stream
+    and a pixel table (stream, chainage, lat, lon, BOD, COD).
     """
+    _require_earth_engine()
+
     kml_bytes = await kml.read()
     if not kml_bytes:
         raise HTTPException(status_code=400, detail="KML file is empty.")
 
     try:
-        result, dashboards = await asyncio.to_thread(
-            bod_cod_streams_pipeline, kml_bytes
-        )
-        # Attach one HTML dashboard per stream (same viewer as river BOD/COD).
-        dash_by_id = {d["stream_id"]: d for d in dashboards}
-        for stream in result.get("streams") or []:
-            dash = dash_by_id.get(stream["stream_id"])
-            if not dash:
-                continue
-            viewer_id = uuid.uuid4().hex
-            data_url = _public_url(
-                request, f"/api/bod-cod/viewer/{viewer_id}/data"
-            )
-            html = _embed_dashboard_html(
-                dash["river_key"], dash["dashboard_data"], data_url=data_url
-            )
-            _DASHBOARD_CACHE[viewer_id] = {
-                "html": html,
-                "data": dash["dashboard_data"],
-                "river_key": dash["river_key"],
-                "stream_id": stream["stream_id"],
-                "stream_name": stream.get("stream_name"),
-            }
-            stream["viewer_id"] = viewer_id
-            stream["dashboard_url"] = _public_url(
-                request, f"/api/bod-cod/viewer/{viewer_id}"
-            )
-            stream["dashboard_data_url"] = data_url
+        result = await asyncio.to_thread(analyze_streams_bod_cod, kml_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Streams BOD/COD pipeline failed: {exc}",
+            detail=f"Streams BOD/COD analysis failed: {exc}",
         ) from exc
 
-    return result
+    return await asyncio.to_thread(_streams_bod_cod_response, request, result)
+
+
+@app.get("/api/streams-bod-cod/kml/{kml_id}")
+async def download_streams_bod_cod_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/streams-bod-cod again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="streams_bod_cod_pixels.kml"'
+        },
+    )
 
 
 def _store_kml(kml_bytes: bytes) -> str:
@@ -603,8 +551,9 @@ async def drainage(
     """
     Upload river polygon KML → main-stream + sub-stream KMLs (MERIT Hydro).
 
-    Returns downloadable KML ids for each layer. Pass those ids to
-    POST /api/drainage/bod-cod for hourly BOD/COD (100 m chainage).
+    Returns downloadable KML ids for each layer. For BOD/COD: upload the
+    main-stream KML to POST /api/main-bod-cod, or sub-stream KML to
+    POST /api/streams-bod-cod.
     """
     if os.getenv("DRAINAGE_SOURCE", "earthengine").lower() != "synthetic":
         _require_earth_engine()
@@ -625,8 +574,6 @@ async def drainage(
 
     main_id = _store_kml(result.pop("main_stream_kml_bytes"))
     sub_id = _store_kml(result.pop("sub_stream_kml_bytes"))
-    _DRAINAGE_KIND[main_id] = "main_stream"
-    _DRAINAGE_KIND[sub_id] = "sub_stream"
     result.pop("geojson", None)
     result["main_stream"] = {
         "kml_id": main_id,
@@ -674,154 +621,6 @@ async def download_drainage_kml(kml_id: str) -> Response:
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="drainage.kml"'},
     )
-
-
-@app.post("/api/drainage/bod-cod")
-async def drainage_bod_cod(
-    request: Request,
-    main_stream_kml_id: str = Form(
-        ..., description="main_stream.kml_id from POST /api/drainage"
-    ),
-    sub_stream_kml_id: str = Form(
-        ..., description="sub_stream.kml_id from POST /api/drainage"
-    ),
-    include_sub_series: bool = Form(
-        False,
-        description=(
-            "If true, embed full hourly live/forecast arrays for every "
-            "sub-stream in this JSON (can be multi‑MB and breaks Swagger UI). "
-            "Default false: each sub-stream keeps today + dashboard_data_url "
-            "with the full hourly series (same data as /api/bod-cod)."
-        ),
-    ),
-) -> Dict[str, Any]:
-    """
-    Drainage KML ids → BOD/COD for main stream and each sub stream.
-
-    Main stream: 100 m chainage, hourly series (same as /api/bod-cod).
-    Each sub-stream placemark: one 100 m chainage, hourly BOD/COD
-    (full series on dashboard_data_url; set include_sub_series=true to
-    also embed arrays in this response).
-
-    Ids are auto-classified from POST /api/drainage (kind cache). If the two
-    form fields are swapped, they are corrected automatically.
-    """
-    id_a = main_stream_kml_id.strip()
-    id_b = sub_stream_kml_id.strip()
-    kind_a = _DRAINAGE_KIND.get(id_a)
-    kind_b = _DRAINAGE_KIND.get(id_b)
-    if kind_a == "sub_stream" and kind_b == "main_stream":
-        id_a, id_b = id_b, id_a
-    elif kind_a is not None and kind_b is not None:
-        if kind_a != "main_stream" or kind_b != "sub_stream":
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Pass the main_stream and sub_stream kml_id values from "
-                    "POST /api/drainage (one of each)."
-                ),
-            )
-
-    main_bytes = _get_cached_kml(id_a)
-    sub_bytes = _get_cached_kml(id_b)
-    if main_bytes is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"main_stream_kml_id '{main_stream_kml_id}' not found or expired. "
-                "Run POST /api/drainage again."
-            ),
-        )
-    if sub_bytes is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"sub_stream_kml_id '{sub_stream_kml_id}' not found or expired. "
-                "Run POST /api/drainage again."
-            ),
-        )
-
-    try:
-        result, main_dashboard, sub_dashboards = await asyncio.to_thread(
-            drainage_bod_cod_pipeline, main_bytes, sub_bytes
-        )
-
-        main_viewer_id = uuid.uuid4().hex
-        main_data_url = _public_url(
-            request, f"/api/bod-cod/viewer/{main_viewer_id}/data"
-        )
-        main_key = result["main_stream"].get("river_key") or "custom"
-        main_html = _embed_dashboard_html(
-            main_key, main_dashboard, data_url=main_data_url
-        )
-        _DASHBOARD_CACHE[main_viewer_id] = {
-            "html": main_html,
-            "data": main_dashboard,
-            "river_key": main_key,
-        }
-        result["main_stream"]["viewer_id"] = main_viewer_id
-        result["main_stream"]["dashboard_url"] = _public_url(
-            request, f"/api/bod-cod/viewer/{main_viewer_id}"
-        )
-        result["main_stream"]["dashboard_data_url"] = main_data_url
-        result["main_stream"]["kml_id"] = id_a
-        result["sub_stream"]["kml_id"] = id_b
-
-        dash_by_id = {d["stream_id"]: d for d in sub_dashboards}
-        for stream in result["sub_stream"].get("streams") or []:
-            dash = dash_by_id.get(stream["stream_id"])
-            if not dash:
-                continue
-            viewer_id = uuid.uuid4().hex
-            data_url = _public_url(
-                request, f"/api/bod-cod/viewer/{viewer_id}/data"
-            )
-            html = _embed_dashboard_html(
-                dash["river_key"], dash["dashboard_data"], data_url=data_url
-            )
-            _DASHBOARD_CACHE[viewer_id] = {
-                "html": html,
-                "data": dash["dashboard_data"],
-                "river_key": dash["river_key"],
-                "stream_id": stream["stream_id"],
-                "stream_name": stream.get("stream_name"),
-            }
-            stream["viewer_id"] = viewer_id
-            stream["dashboard_url"] = _public_url(
-                request, f"/api/bod-cod/viewer/{viewer_id}"
-            )
-            stream["dashboard_data_url"] = data_url
-            # Full hourly series always lives on dashboard_data_url.
-            # Embedding N×90-day hourly arrays here freezes Swagger UI.
-            if not include_sub_series:
-                stream.pop("live", None)
-                stream.pop("forecast", None)
-                stream["series"] = {
-                    "resolution": "hourly",
-                    "embedded": False,
-                    "dashboard_data_url": data_url,
-                    "note": (
-                        "Full hourly live/forecast is at dashboard_data_url. "
-                        "Set include_sub_series=true to embed arrays here."
-                    ),
-                }
-            else:
-                stream["series"] = {
-                    "resolution": "hourly",
-                    "embedded": True,
-                }
-        result["sub_stream"]["include_sub_series"] = bool(include_sub_series)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Drainage BOD/COD pipeline failed: {exc}",
-        ) from exc
-
-    return result
 
 
 def _require_earth_engine() -> None:
@@ -1935,7 +1734,8 @@ async def download_fabdem_dtm_raw_tif(tif_id: str) -> Response:
 ALL_APIS_MAX_CONCURRENCY = int(os.environ.get("ALL_APIS_MAX_CONCURRENCY", "2"))
 ALL_API_NAMES = (
     "flood_water",
-    "bod_cod",
+    "main_bod_cod",
+    "streams_bod_cod",
     "vegetation_type",
     "vegetation_health",
     "lulc",
@@ -1989,7 +1789,8 @@ async def all_apis(
 
     jobs = {
         "flood_water": lambda: flood_water(request, upload()),
-        "bod_cod": lambda: bod_cod(request, upload()),
+        "main_bod_cod": lambda: main_bod_cod(request, upload()),
+        "streams_bod_cod": lambda: streams_bod_cod(request, upload()),
         "vegetation_type": lambda: vegetation_type(request, upload()),
         "vegetation_health": lambda: vegetation_health(request, upload()),
         "lulc": lambda: lulc(request, upload()),
