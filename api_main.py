@@ -6,8 +6,10 @@ Endpoints:
   POST /api/flood-water           — KML → flood/water datewise (fixed 1 Jun 2026→today)
   POST /api/flood-water-dated     — KML + start/end dates → same flood buffer logic
   POST /api/main-bod-cod          — stream KML → daily BOD/COD (Landsat Wang + S2 COD)
+  POST /api/bod-cod               — alias of /api/main-bod-cod
   POST /api/streams-bod-cod       — joining/sub-stream KML → per-stream BOD/COD + pixels
   POST /api/drainage              — polygon KML → main-stream + sub-stream KMLs
+  POST /api/copernicus-dsm        — KML → Copernicus GLO-30 DSM GeoTIFF
 
 Usage:
     python api_main.py
@@ -56,6 +58,7 @@ from jalnetra.bank_erosion_service import (
 )
 from jalnetra.bod_cod_service import analyze_main_bod_cod, analyze_streams_bod_cod
 from jalnetra.drainage_service import DrainageError, analyze_drainage
+from jalnetra.copernicus_dsm_service import download_copernicus_dsm_from_kml
 from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fishing_point_service import (
@@ -242,7 +245,8 @@ async def root() -> Dict[str, Any]:
         "docs": "/docs",
         "endpoints": (
             "POST /api/flood-water, POST /api/flood-water-dated, "
-            "POST /api/main-bod-cod, POST /api/streams-bod-cod, POST /api/drainage, "
+            "POST /api/main-bod-cod (alias POST /api/bod-cod), "
+            "POST /api/streams-bod-cod, POST /api/drainage, "
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
             "POST /api/water-quality, POST /api/eutrophication, POST /api/nitrogen, "
@@ -425,6 +429,7 @@ def _main_bod_cod_response(request: Request, result: Dict[str, Any]) -> Dict[str
 
 
 @app.post("/api/main-bod-cod")
+@app.post("/api/bod-cod", include_in_schema=False)
 async def main_bod_cod(
     request: Request,
     kml: UploadFile = File(
@@ -438,6 +443,8 @@ async def main_bod_cod(
     COD from BOD×ratio + Sentinel-2 TSS/NDCI correction.
     One value per Landsat acquisition day (not hourly). Returns per-stream
     mean/min/max, daily chainage series, and a downloadable pixel KML.
+
+    Alias: POST /api/bod-cod (same handler).
     """
     _require_earth_engine()
 
@@ -459,6 +466,7 @@ async def main_bod_cod(
 
 
 @app.get("/api/main-bod-cod/kml/{kml_id}")
+@app.get("/api/bod-cod/kml/{kml_id}", include_in_schema=False)
 async def download_main_bod_cod_kml(kml_id: str) -> Response:
     kml_bytes = _get_cached_kml(kml_id)
     if kml_bytes is None:
@@ -1726,6 +1734,58 @@ async def download_fabdem_dtm_raw_tif(tif_id: str) -> Response:
         headers={
             "Content-Disposition": (
                 'attachment; filename="FABDEM_DTM_KML_Clipped_NoSmoothing.tif"'
+            )
+        },
+    )
+
+
+@app.post("/api/copernicus-dsm")
+async def copernicus_dsm(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → download Copernicus GLO-30 DSM for the KML bbox, clip to exact
+    KML geometry, and return a GeoTIFF download URL (open in QGIS).
+    """
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        result = await asyncio.to_thread(download_copernicus_dsm_from_kml, kml_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Copernicus DSM failed: {exc}"
+        ) from exc
+
+    tif_id = uuid.uuid4().hex
+    _TIF_CACHE[tif_id] = result.pop("tif_bytes")
+    result["tif_id"] = tif_id
+    result["tif_download_url"] = _public_url(
+        request, f"/api/copernicus-dsm/tif/{tif_id}"
+    )
+    return result
+
+
+@app.get("/api/copernicus-dsm/tif/{tif_id}")
+async def download_copernicus_dsm_tif(tif_id: str) -> Response:
+    tif_bytes = _TIF_CACHE.get(tif_id)
+    if tif_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="TIFF not found or expired. Run POST /api/copernicus-dsm again.",
+        )
+    return Response(
+        content=tif_bytes,
+        media_type="image/tiff",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="Copernicus_DSM_KML_Clipped.tif"'
             )
         },
     )
