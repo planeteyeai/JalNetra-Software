@@ -4,7 +4,7 @@ JalNetra live water-depth analysis.
 Input: an EE geometry derived from a KML polygon.
 Output: two KMLs —
   - live water extent (Sentinel-2 MNDWI frequency) in blue
-  - Sentinel-2 relative depth in green -> yellow -> orange -> red
+  - Sentinel-2 relative depth in light blue -> mid blue -> deep blue -> dark navy
 
 Depth is a relative optical band-ratio estimate, not survey-grade bathymetry.
 """
@@ -29,7 +29,8 @@ from jalnetra.scene_dates import (
 KML_NS = "http://www.opengis.net/kml/2.2"
 MAX_EXPORT_PIXELS = 8_000_000
 WATER_BLUE = "0000FF"
-DEPTH_PALETTE = ["00A651", "FFFF00", "FFA500", "FF0000"]
+# Shallow → Moderate → Medium-Deep → Deep
+DEPTH_PALETTE = ["87CEEB", "2E86C1", "1A5276", "0A1628"]
 # Live water = share of clear S2 scenes with MNDWI above threshold (river_depth_gee).
 MNDWI_WATER_THRESHOLD = 0.0
 LIVE_WATER_FREQ_THRESHOLD = 0.5
@@ -257,7 +258,7 @@ def analyze_live_water_depth(
         f"Depth range: {depth_min}-{depth_max} m. "
         "Depth is a relative band-ratio estimate and is not survey-grade bathymetry.",
         box,
-        "Water Depth - Green to Red",
+        "Water Depth - Light Blue to Dark Navy",
         depth_png,
     )
     return {
@@ -280,10 +281,10 @@ def analyze_live_water_depth(
         "depth": {"min_m": stats.get("depth_m_min"), "max_m": stats.get("depth_m_max"), "mean_m": stats.get("depth_m_mean")},
         "legend": {
             "water": "#0000FF",
-            "low_depth": "#00A651",
-            "medium_low_depth": "#FFFF00",
-            "medium_high_depth": "#FFA500",
-            "high_depth": "#FF0000",
+            "low_depth": "#87CEEB",       # Light blue — Shallow
+            "medium_low_depth": "#2E86C1",  # Mid blue — Moderate
+            "medium_high_depth": "#1A5276",  # Deep blue — Medium-Deep
+            "high_depth": "#0A1628",      # Dark navy — Deep
         },
         "water_kml_bytes": water_kml,
         "depth_kml_bytes": depth_kml,

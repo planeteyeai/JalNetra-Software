@@ -1,29 +1,30 @@
 """
 jalnetra.bod_cod_service — Main-stream BOD/COD from Landsat 8/9 + Sentinel-2.
 
-Python port of the Mandvi joining-streams GEE workflow:
+Python port of the Mula-Mutha / Mithi GEE workflow:
 
   BOD : Landsat 8+9 TOA → Wang BOD → fixed local calibration
   COD : BOD × ratio + Sentinel-2 correction (TSS, chlorophyll)
 
-Outputs daily BOD/COD at 10 m chainage along the uploaded stream KML,
-plus a pixel KML (30 m squares) for the period median composite.
+Main API uses the nearest clear Landsat day (CLOUD_COVER < 20) and nearest
+clear Sentinel-2 day, then returns every water pixel (lat/lon + BOD/COD) plus
+a downloadable 30 m pixel KML covering the full river AOI.
 """
 from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from xml.dom import minidom
 
 import ee
 from pyproj import Transformer
-from shapely.geometry import LineString, MultiLineString
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.ops import linemerge, transform as shp_transform, unary_union
 
-from jalnetra.kml_buffer import _geom_to_ee, _utm_epsg
-from jalnetra.scene_dates import recent_window
+from jalnetra.kml_buffer import _geom_to_ee, _utm_epsg, load_geometry_from_kml_bytes
+from jalnetra.scene_dates import recent_window, select_clear_s2_date
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 
@@ -54,6 +55,8 @@ PALETTE = ["006400", "7FFF00", "FFFF00", "FFA500", "FF0000"]
 EE_GETINFO_CHUNK = 4000
 CHAINAGE_SAMPLE_CHUNK = 1500
 PIXEL_KML_MAX = 4000
+# Main BOD/COD: pull every water pixel (GEE sample numPixels ≈ 1e9).
+MAIN_PIXEL_MAX = 200_000
 
 
 def _local_name(tag: str) -> str:
@@ -265,16 +268,21 @@ def _water_mask(
         .selfMask()
     )
 
-    dw_water = ee.Image(0).selfMask()
+    # Empty DW .mean() has 0 bands → Image.gte crashes; keep Landsat-only then.
+    dw_water = ee.Image.constant(0).rename("water").selfMask()
     if USE_DYNAMIC_WORLD:
         dw_col = (
             ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
             .filterBounds(aoi)
             .filterDate(start, end)
         )
-        dw_water = (
-            dw_col.select("water").mean().gte(DW_WATER_THRESHOLD).selfMask()
-        )
+        if int(dw_col.size().getInfo() or 0) > 0:
+            dw_water = (
+                dw_col.select("water")
+                .mean()
+                .gte(DW_WATER_THRESHOLD)
+                .selfMask()
+            )
     water_mask = ls_water.unmask(0).Or(dw_water.unmask(0)).selfMask()
     if USE_WATER_MASK:
         return water_mask.rename("Water").clip(aoi)
@@ -510,6 +518,123 @@ def _safe_float(v: Any) -> Optional[float]:
     return f
 
 
+def _next_day(day: str) -> str:
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+
+
+def _main_aoi_from_kml(
+    kml_bytes: bytes, features: List[Dict[str, Any]]
+) -> Tuple[ee.Geometry, float]:
+    """
+    Full river AOI for pixel sampling.
+
+    Polygon KMLs use the polygon itself (GEE FeatureCollection AOI).
+    Line KMLs keep the documented 45 m stream buffer.
+    """
+    try:
+        raw = load_geometry_from_kml_bytes(kml_bytes)
+    except Exception:
+        raw = None
+    if isinstance(raw, (Polygon, MultiPolygon)) and not raw.is_empty:
+        return _geom_to_ee(raw), 0.0
+    merged = unary_union([f["geometry"] for f in features])
+    return _geom_to_ee(merged).buffer(STREAM_BUFFER_M), STREAM_BUFFER_M
+
+
+def _select_nearest_clear_landsat_date(
+    ls_raw: ee.ImageCollection,
+) -> Tuple[str, float, str]:
+    """
+    Newest Landsat acquisition day with the lowest CLOUD_COVER among scenes
+    that day (already filtered CLOUD_COVER < MAX_CLOUD).
+    """
+    scenes = (
+        ls_raw.sort("system:time_start", False)
+        .map(
+            lambda img: ee.Feature(
+                None,
+                {
+                    "date": ee.Date(img.get("system:time_start")).format(
+                        "YYYY-MM-dd"
+                    ),
+                    "cloud_pct": img.get("CLOUD_COVER"),
+                    "satellite": img.get("SPACECRAFT_ID"),
+                },
+            )
+        )
+        .getInfo()
+    )
+    feats = (scenes or {}).get("features") or []
+    by_day: Dict[str, List[float]] = {}
+    for feat in feats:
+        props = feat.get("properties") or {}
+        day = props.get("date")
+        cloud = _safe_float(props.get("cloud_pct"))
+        if not day:
+            continue
+        by_day.setdefault(str(day), []).append(
+            cloud if cloud is not None else 100.0
+        )
+    if not by_day:
+        raise ValueError("No Landsat acquisition dates found in collection.")
+
+    # Newest first; among ties on date list order, already newest-first keys.
+    ranked = sorted(
+        (
+            (day, min(clouds), sum(clouds) / len(clouds))
+            for day, clouds in by_day.items()
+        ),
+        key=lambda row: row[0],
+        reverse=True,
+    )
+    # Prefer a clear day (mean cloud among that day's scenes); fall back to newest.
+    clear = [row for row in ranked if row[1] <= MAX_CLOUD]
+    chosen = clear[0] if clear else ranked[0]
+    reason = "nearest_clear_date" if clear else "nearest_date_in_window"
+    return chosen[0], float(chosen[1]), reason
+
+
+def _sample_all_water_pixels(
+    bodcod: ee.Image,
+    aoi: ee.Geometry,
+    ls_proj: ee.Projection,
+    *,
+    stream_name: str = "",
+    max_pixels: int = MAIN_PIXEL_MAX,
+) -> List[Dict[str, Any]]:
+    """Every valid water pixel (lat/lon + BOD/COD) over the full AOI."""
+    pixel_fc = bodcod.addBands(ee.Image.pixelLonLat()).sample(
+        region=aoi,
+        projection=ls_proj,
+        scale=LANDSAT_SCALE_M,
+        numPixels=int(1e9),
+        dropNulls=True,
+        geometries=False,
+        tileScale=4,
+    )
+    out: List[Dict[str, Any]] = []
+    for feat in _fc_features(pixel_fc, max_features=max_pixels):
+        props = feat.get("properties") or {}
+        bod = _safe_float(props.get("BOD_mg_L"))
+        cod = _safe_float(props.get("COD_mg_L"))
+        lon = _safe_float(props.get("longitude"))
+        lat = _safe_float(props.get("latitude"))
+        if None in (bod, cod, lon, lat):
+            continue
+        out.append(
+            {
+                "stream_name": stream_name,
+                "longitude": round(lon, 6),
+                "latitude": round(lat, 6),
+                "bod_mg_L": round(bod, 3),
+                "cod_mg_L": round(cod, 3),
+                "bod_unit": "mg/L",
+                "cod_unit": "mg/L",
+            }
+        )
+    return out
+
+
 def analyze_main_bod_cod(
     kml_bytes: bytes,
     *,
@@ -517,14 +642,16 @@ def analyze_main_bod_cod(
     end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run main-stream BOD/COD analysis.
+    Run main-stream BOD/COD analysis (GEE Mula-Mutha / Mithi logic).
 
-    Daily values = one BOD/COD sample per Landsat acquisition day at each
-    10 m chainage point. COD uses period Sentinel-2 TSS/NDCI correction.
+    Uses the nearest clear Landsat 8/9 TOA day and nearest clear Sentinel-2
+    day inside the look-back window. Returns mean/min/max, every water pixel
+    with lat/lon, 10 m chainage series for the selected day, and a pixel KML.
     """
     features = parse_stream_features(kml_bytes)
+    window_start, window_end = recent_window()
     if start_date is None or end_date is None:
-        start_date, end_date = recent_window()
+        start_date, end_date = window_start, window_end
 
     all_chainage: List[Dict[str, Any]] = []
     for f in features:
@@ -539,8 +666,7 @@ def analyze_main_bod_cod(
     if not all_chainage:
         raise ValueError("Could not build 10 m chainage points from stream KML.")
 
-    merged = unary_union([f["geometry"] for f in features])
-    aoi = _geom_to_ee(merged).buffer(STREAM_BUFFER_M)
+    aoi, aoi_buffer_m = _main_aoi_from_kml(kml_bytes, features)
     stream_buf = _ee_stream_buffers(features)
 
     ls_raw = _get_landsat(aoi, start_date, end_date)
@@ -551,23 +677,45 @@ def analyze_main_bod_cod(
             f"with CLOUD_COVER < {MAX_CLOUD}."
         )
     landsat_dates = _dates_of(ls_raw)
+    selected_ls_date, selected_ls_cloud, ls_selection = (
+        _select_nearest_clear_landsat_date(ls_raw)
+    )
+    ls_day_start = selected_ls_date
+    ls_day_end = _next_day(selected_ls_date)
 
-    ls_proj = ee.Image(ls_raw.first()).select("B3").projection()
-    ls_median = (
-        ls_raw.map(_mask_landsat)
+    ls_day_col = ls_raw.filterDate(ls_day_start, ls_day_end)
+    ls_proj = ee.Image(ls_day_col.first()).select("B3").projection()
+    ls_image = (
+        ls_day_col.map(_mask_landsat)
         .median()
         .setDefaultProjection(ls_proj)
         .clip(aoi)
     )
-    water = _water_mask(ls_median, aoi, start_date, end_date)
+
+    # Nearest clear Sentinel-2 day for TSS / NDCI COD correction terms.
+    try:
+        s2_sel = select_clear_s2_date(
+            aoi, max_cloud_pct=float(MAX_CLOUD_S2)
+        )
+        s2_start = s2_sel["start_date"]
+        s2_end = s2_sel["end_date"]
+        selected_s2_date = s2_sel["selected_date"]
+        s2_selection = s2_sel["selection"]
+    except ValueError:
+        # Fall back to the Landsat day window if no clear S2 exists.
+        s2_start, s2_end = ls_day_start, ls_day_end
+        selected_s2_date = selected_ls_date
+        s2_selection = "landsat_day_fallback"
+
+    # DW over the full look-back window (single Landsat day often has no DW scene).
+    water = _water_mask(ls_image, aoi, start_date, end_date)
     tss_norm, ndci_norm, s2_count = _s2_correction(
-        aoi, start_date, end_date, ls_proj
+        aoi, s2_start, s2_end, ls_proj
     )
 
-    # Period-median BOD/COD (for per-stream stats + pixel KML).
-    bod_med = _calibrated_bod(ls_median, water)
-    cod_med = _cod_from_bod(bod_med, tss_norm, ndci_norm, water)
-    bodcod_med = bod_med.addBands(cod_med)
+    bod = _calibrated_bod(ls_image, water)
+    cod = _cod_from_bod(bod, tss_norm, ndci_norm, water)
+    bodcod = bod.addBands(cod)
 
     reducer = (
         ee.Reducer.mean()
@@ -575,7 +723,17 @@ def analyze_main_bod_cod(
         .combine(reducer2=ee.Reducer.max(), sharedInputs=True)
         .combine(reducer2=ee.Reducer.count(), sharedInputs=True)
     )
-    per_stream = bodcod_med.reduceRegions(
+    # Full-AOI stats (GEE reduceRegion) — covers entire river, not a half buffer.
+    aoi_stats = bodcod.reduceRegion(
+        reducer=reducer,
+        geometry=aoi,
+        scale=LANDSAT_SCALE_M,
+        maxPixels=1e13,
+        bestEffort=True,
+        tileScale=4,
+    ).getInfo() or {}
+
+    per_stream = bodcod.reduceRegions(
         collection=stream_buf,
         reducer=reducer,
         scale=LANDSAT_SCALE_M,
@@ -584,86 +742,44 @@ def analyze_main_bod_cod(
     )
     per_stream_info = _fc_features(per_stream)
 
-    # Pixel samples for KML — sample each stream buffer separately (≤4k total).
-    kml_pixels: List[Dict[str, Any]] = []
-    for f in features:
-        if len(kml_pixels) >= PIXEL_KML_MAX:
-            break
-        remaining = PIXEL_KML_MAX - len(kml_pixels)
-        region = _geom_to_ee(f["geometry"]).buffer(STREAM_BUFFER_M)
-        pixel_fc = (
-            bodcod_med.addBands(ee.Image.pixelLonLat())
-            .sample(
-                region=region,
-                projection=ls_proj,
-                scale=LANDSAT_SCALE_M,
-                numPixels=int(1e7),
-                dropNulls=True,
-                geometries=False,
-                tileScale=4,
-            )
-            .limit(remaining)
-        )
-        for feat in _fc_features(pixel_fc, max_features=remaining):
-            props = feat.get("properties") or {}
-            bod = _safe_float(props.get("BOD_mg_L"))
-            cod = _safe_float(props.get("COD_mg_L"))
-            lon = _safe_float(props.get("longitude"))
-            lat = _safe_float(props.get("latitude"))
-            if None in (bod, cod, lon, lat):
-                continue
-            kml_pixels.append(
-                {
-                    "stream_name": f["stream_name"],
-                    "longitude": lon,
-                    "latitude": lat,
-                    "bod_mg_L": round(bod, 3),
-                    "cod_mg_L": round(cod, 3),
-                }
-            )
+    default_stream_name = features[0]["stream_name"] if features else ""
+    kml_pixels = _sample_all_water_pixels(
+        bodcod,
+        aoi,
+        ls_proj,
+        stream_name=default_stream_name,
+        max_pixels=MAIN_PIXEL_MAX,
+    )
 
-    # Daily BOD/COD at 10 m chainage — day × point-chunk to stay under EE 5k limit.
+    # Chainage series for the selected clear Landsat day (same response shape).
     daily_by_point: Dict[Tuple[str, float], List[Dict[str, Any]]] = {}
     point_chunks = _chunks(all_chainage, CHAINAGE_SAMPLE_CHUNK)
-
-    for day in landsat_dates:
-        start = ee.Date.parse("YYYY-MM-dd", day)
-        day_col = ls_raw.filterDate(start, start.advance(1, "day")).map(
-            _mask_landsat
+    for pts in point_chunks:
+        sampled = bodcod.sampleRegions(
+            collection=_ee_chainage_fc(pts),
+            scale=LANDSAT_SCALE_M,
+            projection=ls_proj,
+            geometries=False,
+            tileScale=4,
         )
-        day_img = (
-            day_col.median().setDefaultProjection(ls_proj).clip(aoi)
-        )
-        bod = _calibrated_bod(day_img, water)
-        cod = _cod_from_bod(bod, tss_norm, ndci_norm, water)
-        stacked = bod.addBands(cod)
-
-        for pts in point_chunks:
-            sampled = stacked.sampleRegions(
-                collection=_ee_chainage_fc(pts),
-                scale=LANDSAT_SCALE_M,
-                projection=ls_proj,
-                geometries=False,
-                tileScale=4,
+        for feat in _fc_features(sampled):
+            props = feat.get("properties") or {}
+            sid = str(props.get("stream_id") or "")
+            ch = _safe_float(props.get("chainage_m"))
+            bod_v = _safe_float(props.get("BOD_mg_L"))
+            cod_v = _safe_float(props.get("COD_mg_L"))
+            if ch is None or bod_v is None or cod_v is None:
+                continue
+            key = (sid, round(ch, 1))
+            daily_by_point.setdefault(key, []).append(
+                {
+                    "date": selected_ls_date,
+                    "bod_mg_L": round(bod_v, 3),
+                    "cod_mg_L": round(cod_v, 3),
+                    "bod_unit": "mg/L",
+                    "cod_unit": "mg/L",
+                }
             )
-            for feat in _fc_features(sampled):
-                props = feat.get("properties") or {}
-                sid = str(props.get("stream_id") or "")
-                ch = _safe_float(props.get("chainage_m"))
-                bod_v = _safe_float(props.get("BOD_mg_L"))
-                cod_v = _safe_float(props.get("COD_mg_L"))
-                if ch is None or bod_v is None or cod_v is None:
-                    continue
-                key = (sid, round(ch, 1))
-                daily_by_point.setdefault(key, []).append(
-                    {
-                        "date": str(day),
-                        "bod_mg_L": round(bod_v, 3),
-                        "cod_mg_L": round(cod_v, 3),
-                        "bod_unit": "mg/L",
-                        "cod_unit": "mg/L",
-                    }
-                )
 
     streams_out: List[Dict[str, Any]] = []
     stats_by_name = {
@@ -684,7 +800,6 @@ def analyze_main_bod_cod(
                 daily_by_point.get(key, []),
                 key=lambda r: r["date"],
             )
-            # Daily entries also carry lat/lon so clients can map without join.
             daily_with_xy = [
                 {
                     **row,
@@ -702,6 +817,9 @@ def analyze_main_bod_cod(
                 }
             )
         st = stats_by_name.get(f["stream_name"], {})
+        # Prefer per-stream reduceRegions; fall back to full-AOI stats.
+        if not st or st.get("BOD_mg_L_count") in (None, 0):
+            st = aoi_stats
         streams_out.append(
             {
                 "stream_id": f["stream_id"],
@@ -731,13 +849,19 @@ def analyze_main_bod_cod(
         ),
         "method": (
             "Landsat 8+9 TOA Wang BOD with local calibration; "
-            "COD = BOD×ratio + Sentinel-2 TSS/NDCI correction"
+            "COD = BOD×ratio + Sentinel-2 TSS/NDCI correction; "
+            "nearest clear Landsat + Sentinel-2 day"
         ),
         "resolution": "daily",
         "chainage_step_m": int(CHAINAGE_STEP_M),
-        "stream_buffer_m": STREAM_BUFFER_M,
+        "stream_buffer_m": aoi_buffer_m,
         "start_date": start_date,
         "end_date": end_date,
+        "selected_landsat_date": selected_ls_date,
+        "selected_landsat_cloud_pct": selected_ls_cloud,
+        "landsat_selection": ls_selection,
+        "selected_sentinel2_date": selected_s2_date,
+        "sentinel2_selection": s2_selection,
         "landsat_image_count": ls_count,
         "landsat_dates": landsat_dates,
         "sentinel2_image_count": s2_count,
@@ -752,10 +876,18 @@ def analyze_main_bod_cod(
             "cod_slope": COD_SLOPE,
             "cod_intercept": COD_INTERCEPT,
         },
+        "stats": {
+            "bod_mg_L_mean": _safe_float(aoi_stats.get("BOD_mg_L_mean")),
+            "bod_mg_L_min": _safe_float(aoi_stats.get("BOD_mg_L_min")),
+            "bod_mg_L_max": _safe_float(aoi_stats.get("BOD_mg_L_max")),
+            "cod_mg_L_mean": _safe_float(aoi_stats.get("COD_mg_L_mean")),
+            "cod_mg_L_min": _safe_float(aoi_stats.get("COD_mg_L_min")),
+            "cod_mg_L_max": _safe_float(aoi_stats.get("COD_mg_L_max")),
+            "water_pixels": int(aoi_stats.get("BOD_mg_L_count") or 0),
+        },
         "stream_count": len(streams_out),
         "chainage_count": len(all_chainage),
         "streams": streams_out,
-        # Period-median water pixels (30 m) with lat/lon for mapping.
         "pixel_count": len(kml_pixels),
         "pixels": [
             {
@@ -763,6 +895,8 @@ def analyze_main_bod_cod(
                 "longitude": p["longitude"],
                 "bod_mg_L": p["bod_mg_L"],
                 "cod_mg_L": p["cod_mg_L"],
+                "bod_unit": p.get("bod_unit", "mg/L"),
+                "cod_unit": p.get("cod_unit", "mg/L"),
                 "stream_name": p.get("stream_name"),
             }
             for p in kml_pixels

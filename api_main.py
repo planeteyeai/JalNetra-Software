@@ -9,7 +9,6 @@ Endpoints:
   POST /api/bod-cod               — alias of /api/main-bod-cod
   POST /api/streams-bod-cod       — joining/sub-stream KML → per-stream BOD/COD + pixels
   POST /api/drainage              — polygon KML → main-stream + sub-stream KMLs
-  POST /api/copernicus-dsm        — KML → Copernicus GLO-30 DSM GeoTIFF
 
 Usage:
     python api_main.py
@@ -58,7 +57,6 @@ from jalnetra.bank_erosion_service import (
 )
 from jalnetra.bod_cod_service import analyze_main_bod_cod, analyze_streams_bod_cod
 from jalnetra.drainage_service import DrainageError, analyze_drainage
-from jalnetra.copernicus_dsm_service import download_copernicus_dsm_from_kml
 from jalnetra.fabdem_raw_service import download_fabdem_dtm_raw_from_kml
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml
 from jalnetra.fishing_point_service import (
@@ -253,7 +251,7 @@ async def root() -> Dict[str, Any]:
             "POST /api/coliform, POST /api/water-depth, POST /api/lithology, "
             "POST /api/silt-classification, POST /api/silt-volume, "
             "POST /api/fishing-point, POST /api/fabdem-dtm, "
-            "POST /api/fabdem-dtm-raw, POST /api/copernicus-dsm, "
+            "POST /api/fabdem-dtm-raw, "
             "POST /api/all (one KML -> every API)"
         ),
         "ngrok_free_tier": (
@@ -715,11 +713,14 @@ def _vegetation_response(
 
 
 def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach four KML download URLs (WST, TSS, NDWI, NDCI)."""
+    """Attach TSS and NDCI KML download URLs (WST / permanent-water NDWI omitted)."""
+    # Drop WST and permanent-water NDWI from the API response.
+    result.pop("wst", None)
+    result.pop("ndwi", None)
+    result.pop("wst_kml_bytes", None)
+    result.pop("ndwi_kml_bytes", None)
     layers = {
-        "wst": ("wst_kml_bytes", "wst.kml"),
         "tss": ("tss_kml_bytes", "tss_turbidity.kml"),
-        "ndwi": ("ndwi_kml_bytes", "ndwi_permanent_water.kml"),
         "ndci": ("ndci_kml_bytes", "ndci_chlorophyll.kml"),
     }
     for layer_key, (bytes_key, filename) in layers.items():
@@ -1133,12 +1134,11 @@ async def water_quality(
     kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
 ) -> Dict[str, Any]:
     """
-    Upload KML → four water quality KML layers.
+    Upload KML → water quality KML layers.
 
-    Returns WST, TSS (turbidity), NDWI (permanent water), and NDCI (chlorophyll).
+    Returns TSS (turbidity) and NDCI (chlorophyll).
     No date input: Sentinel-2 + Dynamic World use the nearest clear date in the
-    last 30 days; Landsat 9 WST uses the median of that same 30-day window.
-    No buffer.
+    last 30 days. No buffer.
     """
     _require_earth_engine()
 
@@ -1460,7 +1460,7 @@ async def lithology(
 
     result["scene_selection"] = scene
     return _vegetation_response(
-        request, result, prefix="lithology", filename="lithology.kml", smooth=False
+        request, result, prefix="lithology", filename="lithology.kml", smooth=True
     )
 
 
@@ -1541,15 +1541,6 @@ async def silt_volume(
         kml, include_classification=False, include_volume=True
     )
     return await asyncio.to_thread(_silt_volume_response, request, result)
-
-
-@app.post("/api/silt")
-async def silt(
-    request: Request,
-    kml: UploadFile = File(..., description="KML AOI boundary (no buffer)"),
-) -> Dict[str, Any]:
-    """Alias of POST /api/silt-classification (classification KMLs only)."""
-    return await silt_classification(request, kml)
 
 
 @app.get("/api/silt/kml/{kml_id}")
@@ -1734,58 +1725,6 @@ async def download_fabdem_dtm_raw_tif(tif_id: str) -> Response:
         headers={
             "Content-Disposition": (
                 'attachment; filename="FABDEM_DTM_KML_Clipped_NoSmoothing.tif"'
-            )
-        },
-    )
-
-
-@app.post("/api/copernicus-dsm")
-async def copernicus_dsm(
-    request: Request,
-    kml: UploadFile = File(..., description="KML AOI boundary"),
-) -> Dict[str, Any]:
-    """
-    Upload KML → download Copernicus GLO-30 DSM for the KML bbox, clip to exact
-    KML geometry, and return a GeoTIFF download URL (open in QGIS).
-    """
-    kml_bytes = await kml.read()
-    if not kml_bytes:
-        raise HTTPException(status_code=400, detail="KML file is empty.")
-
-    try:
-        result = await asyncio.to_thread(download_copernicus_dsm_from_kml, kml_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Copernicus DSM failed: {exc}"
-        ) from exc
-
-    tif_id = uuid.uuid4().hex
-    _TIF_CACHE[tif_id] = result.pop("tif_bytes")
-    result["tif_id"] = tif_id
-    result["tif_download_url"] = _public_url(
-        request, f"/api/copernicus-dsm/tif/{tif_id}"
-    )
-    return result
-
-
-@app.get("/api/copernicus-dsm/tif/{tif_id}")
-async def download_copernicus_dsm_tif(tif_id: str) -> Response:
-    tif_bytes = _TIF_CACHE.get(tif_id)
-    if tif_bytes is None:
-        raise HTTPException(
-            status_code=404,
-            detail="TIFF not found or expired. Run POST /api/copernicus-dsm again.",
-        )
-    return Response(
-        content=tif_bytes,
-        media_type="image/tiff",
-        headers={
-            "Content-Disposition": (
-                'attachment; filename="Copernicus_DSM_KML_Clipped.tif"'
             )
         },
     )
