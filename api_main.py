@@ -9,6 +9,7 @@ Endpoints:
   POST /api/bod-cod               — alias of /api/main-bod-cod
   POST /api/streams-bod-cod       — joining/sub-stream KML → per-stream BOD/COD + pixels
   POST /api/drainage              — polygon KML → main-stream + sub-stream KMLs
+  POST /api/foam                  — river KML → foam on nearest clear S2 day
 
 Usage:
     python api_main.py
@@ -63,6 +64,7 @@ from jalnetra.fishing_point_service import (
     analyze_fishing_points,
     fishing_point_geometry,
 )
+from jalnetra.foam_service import analyze_foam, foam_geometry
 from jalnetra.kml_buffer import buffered_analysis_geometry
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes
 from jalnetra.lithology_service import analyze_lithology, lithology_geometry
@@ -250,7 +252,7 @@ async def root() -> Dict[str, Any]:
             "POST /api/water-quality, POST /api/eutrophication, POST /api/nitrogen, "
             "POST /api/coliform, POST /api/water-depth, POST /api/lithology, "
             "POST /api/silt-classification, POST /api/silt-volume, "
-            "POST /api/fishing-point, POST /api/fabdem-dtm, "
+            "POST /api/foam, POST /api/fishing-point, POST /api/fabdem-dtm, "
             "POST /api/fabdem-dtm-raw, "
             "POST /api/all (one KML -> every API)"
         ),
@@ -682,11 +684,22 @@ def _get_cached_kml(kml_id: str) -> Optional[bytes]:
         return None
 
 
-def _store_smoothed_kml(kml_bytes: bytes) -> str:
+def _store_smoothed_kml(
+    kml_bytes: bytes,
+    *,
+    opacity: float = 0.70,
+    saturation: float = 1.6,
+    brightness: float = 1.05,
+) -> str:
     """Pixel-smooth GroundOverlay PNGs (kml_pixel_smoother) and cache the KML."""
     kml_id = uuid.uuid4().hex
     try:
-        payload = smooth_kml_bytes(kml_bytes)
+        payload = smooth_kml_bytes(
+            kml_bytes,
+            opacity=opacity,
+            saturation=saturation,
+            brightness=brightness,
+        )
     except Exception:
         payload = kml_bytes
     _put_cached_kml(kml_id, payload)
@@ -700,9 +713,17 @@ def _vegetation_response(
     prefix: str,
     filename: str,
     smooth: bool = True,
+    smooth_opacity: float = 0.70,
+    smooth_saturation: float = 1.6,
+    smooth_brightness: float = 1.05,
 ) -> Dict[str, Any]:
     if smooth:
-        kml_id = _store_smoothed_kml(result.pop("kml_bytes"))
+        kml_id = _store_smoothed_kml(
+            result.pop("kml_bytes"),
+            opacity=smooth_opacity,
+            saturation=smooth_saturation,
+            brightness=smooth_brightness,
+        )
     else:
         kml_id = uuid.uuid4().hex
         _put_cached_kml(kml_id, result.pop("kml_bytes"))
@@ -1418,6 +1439,67 @@ async def download_water_depth_kml(kml_id: str) -> Response:
     )
 
 
+def _foam_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach one foam KML download URL (raw — light EE smooth only, no PNG smoother)."""
+    filename = result.get("kml_filename", "river_foam.kml")
+    kml_id = _store_raw_kml(result.pop("kml_bytes"))
+    result["kml_id"] = kml_id
+    result["kml_download_url"] = _public_url(request, f"/api/foam/kml/{kml_id}")
+    result["kml_filename"] = filename
+    return result
+
+
+@app.post("/api/foam")
+async def foam(
+    request: Request,
+    kml: UploadFile = File(..., description="KML river / AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → one river-foam KML (live water + foam on nearest clear S2 day).
+
+    Water = same MNDWI frequency live-water mask as /api/water-depth.
+    Foam = nearest clear day (Apr–Sep cloud < 70%, else < 20%). Closed-path
+    KMLs become polygons. Light EE focal smooth only. Opaque blue water /
+    white foam.
+    """
+    _require_earth_engine()
+
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        aoi_geom, aoi_info = await asyncio.to_thread(foam_geometry, kml_bytes)
+        result = await asyncio.to_thread(
+            analyze_foam,
+            aoi_geom,
+            aoi_info=aoi_info,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Foam analysis failed: {exc}"
+        ) from exc
+
+    return await asyncio.to_thread(_foam_response, request, result)
+
+
+@app.get("/api/foam/kml/{kml_id}")
+async def download_foam_kml(kml_id: str) -> Response:
+    kml_bytes = _get_cached_kml(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="KML not found or expired. Run POST /api/foam again.",
+        )
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={"Content-Disposition": 'attachment; filename="river_foam.kml"'},
+    )
+
+
 @app.post("/api/lithology")
 async def lithology(
     request: Request,
@@ -1745,6 +1827,7 @@ ALL_API_NAMES = (
     "nitrogen",
     "coliform",
     "water_depth",
+    "foam",
     "lithology",
     "silt_classification",
     "silt_volume",
@@ -1800,6 +1883,7 @@ async def all_apis(
         "nitrogen": lambda: nitrogen(request, upload()),
         "coliform": lambda: coliform(request, upload()),
         "water_depth": lambda: water_depth(request, upload(), depth_min_m, depth_max_m),
+        "foam": lambda: foam(request, upload()),
         "lithology": lambda: lithology(request, upload()),
         "silt_classification": lambda: silt_classification(request, upload()),
         "silt_volume": lambda: silt_volume(request, upload()),
